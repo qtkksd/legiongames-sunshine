@@ -484,11 +484,23 @@ namespace nvhttp {
     bool same_hash = hash.size() == sess.clienthash.size() && std::equal(hash.begin(), hash.end(), sess.clienthash.begin());
     auto verify = crypto::verify256(crypto::x509(client.cert), secret, sign);
     if (same_hash && verify) {
+      // Check if client was already pre-authorized by pin() to avoid duplicates
+      bool already_authorized = false;
+      client_t &client_root_ref = client_root;
+      for (auto &named_cert : client_root_ref.named_devices) {
+        if (named_cert.name == client.name || named_cert.cert == client.cert) {
+          already_authorized = true;
+          break;
+        }
+      }
+
       tree.put("root.paired", 1);
       add_cert->raise(crypto::x509(client.cert));
 
-      // The client is now successfully paired and will be authorized to connect
-      add_authorized_client(client.name, std::move(client.cert));
+      if (!already_authorized) {
+        // The client is now successfully paired and will be authorized to connect
+        add_authorized_client(client.name, std::move(client.cert));
+      }
     } else {
       tree.put("root.paired", 0);
     }
@@ -660,6 +672,25 @@ namespace nvhttp {
     auto &sess = std::begin(map_id_sess)->second;
     getservercert(sess, tree, pin);
     sess.client.name = name;
+
+    // Pre-authorize client immediately after PIN verification succeeds.
+    // This eliminates the race condition where /api/clients/list returns empty
+    // before clientpairingsecret() completes during Moonlight's challenge-response.
+    if (tree.get<int>("root.paired", 0) == 1) {
+      bool already_authorized = false;
+      client_t &client = client_root;
+      for (auto &named_cert : client.named_devices) {
+        if (named_cert.name == sess.client.name || named_cert.cert == sess.client.cert) {
+          already_authorized = true;
+          break;
+        }
+      }
+      if (!already_authorized) {
+        // Copy cert (don't move) — clientpairingsecret() still needs it for
+        // challenge-response verification.
+        add_authorized_client(sess.client.name, std::string(sess.client.cert));
+      }
+    }
 
     // response to the request for pin
     std::ostringstream data;

@@ -1,0 +1,80 @@
+From: LegionGames <dev@legiongames.ru>
+Date: Fri, 01 May 2026 10:55:00 +0300
+Subject: [PATCH] Fix pairing race condition: pre-authorize client in pin()
+
+After PIN verification succeeds, the client is NOT yet in named_devices.
+/api/clients/list returns empty until clientpairingsecret() completes.
+This causes a race where Django checks the client list immediately after
+getting status=true from /api/pin, sees no clients, and reports failure.
+
+This patch:
+1. Pre-authorizes the client in pin() immediately after getservercert()
+   succeeds, adding them to named_devices right away.
+2. Makes clientpairingsecret() idempotent — skips duplicate add if
+   client was already pre-authorized by pin().
+3. Keeps add_cert->raise() in clientpairingsecret() for SSL cert chain
+   verification (still needed for HTTPS connections).
+
+No Moonlight changes needed. Protocol stays 100% compatible.
+
+---
+ src/nvhttp.cpp | 46 +++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/src/nvhttp.cpp b/src/nvhttp.cpp
+index abc123..def456 100644
+--- a/src/nvhttp.cpp
++++ b/src/nvhttp.cpp
+@@ -430,6 +430,20 @@ namespace nvhttp {
+     bool same_hash = hash.size() == sess.clienthash.size() && std::equal(hash.begin(), hash.end(), sess.clienthash.begin());
+     auto verify = crypto::verify256(crypto::x509(client.cert), secret, sign);
+     if (same_hash && verify) {
++      // Check if client was already pre-authorized by pin() to avoid duplicates
++      bool already_authorized = false;
++      client_t &client_root_ref = client_root;
++      for (auto &named_cert : client_root_ref.named_devices) {
++        if (named_cert.name == client.name || named_cert.cert == client.cert) {
++          already_authorized = true;
++          break;
++        }
++      }
++
+       tree.put("root.paired", 1);
+       add_cert->raise(crypto::x509(client.cert));
+ 
+-      // The client is now successfully paired and will be authorized to connect
+-      add_authorized_client(client.name, std::move(client.cert));
++      if (!already_authorized) {
++        // The client is now successfully paired and will be authorized to connect
++        add_authorized_client(client.name, std::move(client.cert));
++      }
+     } else {
+       tree.put("root.paired", 0);
+     }
+@@ -720,6 +734,25 @@ namespace nvhttp {
+     getservercert(sess, tree, pin);
+     sess.client.name = name;
+ 
++    // NEW: Pre-authorize client immediately after PIN verification succeeds.
++    // This eliminates the race condition where /api/clients/list returns empty
++    // before clientpairingsecret() completes during Moonlight's challenge-response.
++    if (tree.get<int>("root.paired", 0) == 1) {
++      bool already_authorized = false;
++      client_t &client = client_root;
++      for (auto &named_cert : client.named_devices) {
++        if (named_cert.name == sess.client.name || named_cert.cert == sess.client.cert) {
++          already_authorized = true;
++          break;
++        }
++      }
++      if (!already_authorized) {
++        // Copy cert (don't move) — clientpairingsecret() still needs it for
++        // challenge-response verification. The cert in named_devices is a
++        // separate copy. UUID will be generated fresh by add_authorized_client().
++        add_authorized_client(sess.client.name, std::string(sess.client.cert));
++      }
++    }
++
+     // response to the request for pin
+     std::ostringstream data;
+     pt::write_xml(data, tree);
