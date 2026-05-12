@@ -1532,6 +1532,301 @@ namespace confighttp {
   }
 
   /**
+   * @brief Get input block configuration and status.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/input-block/status| GET| null}
+   */
+  void getInputBlockStatus(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree;
+
+#ifdef _WIN32
+    const std::filesystem::path devcon_path = platf::appdata().parent_path() / "tools" / "devcon.exe";
+
+    if (!std::filesystem::exists(devcon_path)) {
+      output_tree["configured"] = false;
+      output_tree["error"] = "devcon.exe not found in tools directory";
+      send_response(response, output_tree);
+      return;
+    }
+
+    try {
+      // Run devcon to find HID devices
+      std::error_code ec;
+      std::string cmd = std::format("\"{}\" find \"*HID*\"", devcon_path.string());
+      auto child = platf::run_command(true, false, cmd, {}, {}, nullptr, ec, nullptr);
+
+      if (ec || !child.valid()) {
+        output_tree["configured"] = false;
+        output_tree["error"] = "Failed to run devcon: " + ec.message();
+        send_response(response, output_tree);
+        return;
+      }
+
+      // Parse output to find devices with VID patterns
+      std::set<std::string> found_vids;
+      nlohmann::json devices = nlohmann::json::array();
+      
+      if (child.std_out()) {
+        std::string line;
+        while (std::getline(*child.std_out(), line)) {
+          // Look for VID_XXXX patterns in devcon output
+          std::regex vid_regex("VID_([0-9A-Fa-f]{4})");
+          std::smatch match;
+          if (std::regex_search(line, match, vid_regex)) {
+            std::string vid = match[1].str();
+            std::string pattern = "*VID_" + vid + "*";
+            
+            if (found_vids.insert(vid).second) {
+              // Extract device name (after colon)
+              std::string device_name = line;
+              auto colon_pos = line.find(':');
+              if (colon_pos != std::string::npos) {
+                device_name = line.substr(colon_pos + 1);
+                // Trim leading whitespace
+                device_name.erase(0, device_name.find_first_not_of(" \t"));
+              }
+              
+              devices.push_back({
+                {"vid_pattern", pattern},
+                {"vid", vid},
+                {"name", device_name}
+              });
+            }
+          }
+        }
+      }
+      child.wait();
+
+      output_tree["configured"] = true;
+      output_tree["devcon_path"] = devcon_path.string();
+      output_tree["devices"] = devices;
+      output_tree["device_count"] = devices.size();
+      
+      // Check if any devices are currently blocked by testing one
+      if (!devices.empty()) {
+        std::string test_cmd = std::format("\"{}\" status \"{}\"", devcon_path.string(), 
+                                           devices[0].value("vid_pattern", ""));
+        auto test_child = platf::run_command(true, false, test_cmd, {}, {}, nullptr, ec, nullptr);
+        if (!ec && test_child.valid()) {
+          test_child.wait();
+          // devcon returns 0 if device exists, non-zero if disabled/removed
+          output_tree["blocked"] = (test_child.exit_code() != 0);
+        }
+      }
+    } catch (const std::exception &e) {
+      output_tree["configured"] = false;
+      output_tree["error"] = std::string("Failed to detect devices: ") + e.what();
+    }
+#else
+    output_tree["error"] = "Input blocking is only available on Windows";
+#endif
+
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Block physical keyboard and mouse input.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/input-block/block| POST| null}
+   */
+  void blockInput(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree;
+    nlohmann::json request_body;
+    
+    // Parse request body for vid_patterns
+    try {
+      request_body = nlohmann::json::parse(request->content.string());
+    } catch (const std::exception &e) {
+      // No body or invalid JSON - will auto-detect below
+    }
+
+#ifdef _WIN32
+    const std::filesystem::path devcon_path = platf::appdata().parent_path() / "tools" / "devcon.exe";
+
+    if (!std::filesystem::exists(devcon_path)) {
+      output_tree["status"] = false;
+      output_tree["error"] = "devcon.exe not found in tools directory";
+      send_response(response, output_tree);
+      return;
+    }
+
+    try {
+      std::vector<std::string> vid_patterns;
+      nlohmann::json devices_blocked = nlohmann::json::array();
+
+      // Use provided vid_patterns from request, or auto-detect
+      if (request_body.contains("vid_patterns") && request_body["vid_patterns"].is_array()) {
+        for (const auto &pattern : request_body["vid_patterns"]) {
+          vid_patterns.push_back(pattern.get<std::string>());
+        }
+      }
+
+      if (vid_patterns.empty()) {
+        // Auto-detect: run devcon find *HID*
+        std::error_code ec;
+        std::string cmd = std::format("\"{}\" find \"*HID*\"", devcon_path.string());
+        auto child = platf::run_command(true, false, cmd, {}, {}, nullptr, ec, nullptr);
+
+        if (!ec && child.valid() && child.std_out()) {
+          std::string line;
+          std::set<std::string> found_vids;
+          while (std::getline(*child.std_out(), line)) {
+            std::regex vid_regex("VID_([0-9A-Fa-f]{4})");
+            std::smatch match;
+            if (std::regex_search(line, match, vid_regex)) {
+              std::string vid = match[1].str();
+              if (found_vids.insert(vid).second) {
+                vid_patterns.push_back("*VID_" + vid + "*");
+              }
+            }
+          }
+          child.wait();
+        }
+      }
+
+      if (vid_patterns.empty()) {
+        // Fallback: block all HID
+        vid_patterns.push_back("*HID*");
+      }
+
+      // Disable each device
+      int blocked_count = 0;
+      for (const auto &pattern : vid_patterns) {
+        std::error_code ec;
+        std::string cmd = std::format("\"{}\" disable \"{}\"", devcon_path.string(), pattern);
+        auto child = platf::run_command(true, false, cmd, {}, {}, nullptr, ec, nullptr);
+
+        if (!ec && child.valid()) {
+          child.wait();
+          blocked_count++;
+          devices_blocked.push_back(pattern);
+          BOOST_LOG(info) << "Input block: disabled " << pattern;
+        }
+      }
+
+      output_tree["status"] = true;
+      output_tree["blocked_count"] = blocked_count;
+      output_tree["blocked"] = true;
+      output_tree["vid_patterns"] = devices_blocked;
+    } catch (const std::exception &e) {
+      output_tree["status"] = false;
+      output_tree["error"] = std::string("Failed to block input: ") + e.what();
+    }
+#else
+    output_tree["status"] = false;
+    output_tree["error"] = "Input blocking is only available on Windows";
+#endif
+
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Unblock physical keyboard and mouse input.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/input-block/unblock| POST| null}
+   */
+  void unblockInput(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree;
+    nlohmann::json request_body;
+    
+    // Parse request body for vid_patterns
+    try {
+      request_body = nlohmann::json::parse(request->content.string());
+    } catch (const std::exception &e) {
+      // No body or invalid JSON - will use catch-all below
+    }
+
+#ifdef _WIN32
+    const std::filesystem::path devcon_path = platf::appdata().parent_path() / "tools" / "devcon.exe";
+
+    if (!std::filesystem::exists(devcon_path)) {
+      output_tree["status"] = false;
+      output_tree["error"] = "devcon.exe not found in tools directory";
+      send_response(response, output_tree);
+      return;
+    }
+
+    try {
+      std::vector<std::string> vid_patterns;
+      nlohmann::json devices_unblocked = nlohmann::json::array();
+
+      // Use provided vid_patterns from request, or use catch-all *HID*
+      if (request_body.contains("vid_patterns") && request_body["vid_patterns"].is_array()) {
+        for (const auto &pattern : request_body["vid_patterns"]) {
+          vid_patterns.push_back(pattern.get<std::string>());
+        }
+      }
+
+      if (vid_patterns.empty()) {
+        // Default: unblock all HID devices
+        vid_patterns.push_back("*HID*");
+      }
+
+      int unblocked_count = 0;
+      for (const auto &pattern : vid_patterns) {
+        std::error_code ec;
+        std::string cmd = std::format("\"{}\" enable \"{}\"", devcon_path.string(), pattern);
+        auto child = platf::run_command(true, false, cmd, {}, {}, nullptr, ec, nullptr);
+
+        if (!ec && child.valid()) {
+          child.wait();
+          unblocked_count++;
+          devices_unblocked.push_back(pattern);
+          BOOST_LOG(info) << "Input unblock: enabled " << pattern;
+        }
+      }
+
+      output_tree["status"] = true;
+      output_tree["unblocked_count"] = unblocked_count;
+      output_tree["blocked"] = false;
+      output_tree["vid_patterns"] = devices_unblocked;
+    } catch (const std::exception &e) {
+      output_tree["status"] = false;
+      output_tree["error"] = std::string("Failed to unblock input: ") + e.what();
+    }
+#else
+    output_tree["status"] = false;
+    output_tree["error"] = "Input blocking is only available on Windows";
+#endif
+
+    send_response(response, output_tree);
+  }
+
+  /**
    * @brief Checks whether a directory entry qualifies as an executable file.
    * @param entry The directory entry to check.
    * @param status The cached file status for the entry.
@@ -1783,6 +2078,9 @@ namespace confighttp {
     server.resource["^/api/restart$"]["POST"] = restart;
     server.resource["^/api/vigembus/status$"]["GET"] = getViGEmBusStatus;
     server.resource["^/api/vigembus/install$"]["POST"] = installViGEmBus;
+    server.resource["^/api/input-block/status$"]["GET"] = getInputBlockStatus;
+    server.resource["^/api/input-block/block$"]["POST"] = blockInput;
+    server.resource["^/api/input-block/unblock$"]["POST"] = unblockInput;
 
     // static/dynamic resources
     server.resource["^/images/sunshine.ico$"]["GET"] = getFaviconImage;
