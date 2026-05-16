@@ -11,6 +11,8 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <regex>
+#include <set>
 #include <string_view>
 
 // lib includes
@@ -1531,6 +1533,55 @@ namespace confighttp {
     send_response(response, output_tree);
   }
 
+#ifdef _WIN32
+  /**
+   * @brief Run devcon find for a device class and return parsed device list.
+   * @param devcon_path Path to devcon.exe.
+   * @param device_class Device class name (e.g. "Keyboard", "Mouse", "Monitor"), or empty for HID.
+   * @return JSON array of devices with vid_pattern, vid, name fields.
+   */
+  nlohmann::json find_devcon_devices(const std::filesystem::path &devcon_path, const std::string &device_class) {
+    nlohmann::json devices = nlohmann::json::array();
+    std::error_code ec;
+    boost::filesystem::path working_dir;
+    std::string cmd;
+    if (device_class.empty()) {
+      cmd = std::format("\"{}\" find \"*HID*\"", devcon_path.string());
+    } else {
+      cmd = std::format("\"{}\" find \"={}\"", devcon_path.string(), device_class);
+    }
+    auto child = platf::run_command(true, false, cmd, working_dir, {}, nullptr, ec, nullptr);
+    if (ec || !child.valid() || !child.std_out()) {
+      return devices;
+    }
+    std::set<std::string> found_vids;
+    std::string line;
+    while (std::getline(*child.std_out(), line)) {
+      std::regex vid_regex("VID_([0-9A-Fa-f]{4})");
+      std::smatch match;
+      if (std::regex_search(line, match, vid_regex)) {
+        std::string vid = match[1].str();
+        std::string pattern = "*VID_" + vid + "*";
+        if (found_vids.insert(vid).second) {
+          std::string device_name = line;
+          auto colon_pos = line.find(':');
+          if (colon_pos != std::string::npos) {
+            device_name = line.substr(colon_pos + 1);
+            device_name.erase(0, device_name.find_first_not_of(" \t"));
+          }
+          devices.push_back({
+            {"vid_pattern", pattern},
+            {"vid", vid},
+            {"name", device_name}
+          });
+        }
+      }
+    }
+    child.wait();
+    return devices;
+  }
+#endif
+
   /**
    * @brief Get input block configuration and status.
    * @param response The HTTP response object.
@@ -1558,67 +1609,35 @@ namespace confighttp {
     }
 
     try {
-      // Run devcon to find HID devices
-      std::error_code ec;
-      std::string cmd = std::format("\"{}\" find \"*HID*\"", devcon_path.string());
-      auto child = platf::run_command(true, false, cmd, {}, {}, nullptr, ec, nullptr);
-
-      if (ec || !child.valid()) {
-        output_tree["configured"] = false;
-        output_tree["error"] = "Failed to run devcon: " + ec.message();
-        send_response(response, output_tree);
-        return;
-      }
-
-      // Parse output to find devices with VID patterns
-      std::set<std::string> found_vids;
-      nlohmann::json devices = nlohmann::json::array();
-      
-      if (child.std_out()) {
-        std::string line;
-        while (std::getline(*child.std_out(), line)) {
-          // Look for VID_XXXX patterns in devcon output
-          std::regex vid_regex("VID_([0-9A-Fa-f]{4})");
-          std::smatch match;
-          if (std::regex_search(line, match, vid_regex)) {
-            std::string vid = match[1].str();
-            std::string pattern = "*VID_" + vid + "*";
-            
-            if (found_vids.insert(vid).second) {
-              // Extract device name (after colon)
-              std::string device_name = line;
-              auto colon_pos = line.find(':');
-              if (colon_pos != std::string::npos) {
-                device_name = line.substr(colon_pos + 1);
-                // Trim leading whitespace
-                device_name.erase(0, device_name.find_first_not_of(" \t"));
-              }
-              
-              devices.push_back({
-                {"vid_pattern", pattern},
-                {"vid", vid},
-                {"name", device_name}
-              });
-            }
-          }
-        }
-      }
-      child.wait();
+      // Enumerate devices by class
+      nlohmann::json keyboard_devices = find_devcon_devices(devcon_path, "Keyboard");
+      nlohmann::json mouse_devices = find_devcon_devices(devcon_path, "Mouse");
+      nlohmann::json monitor_devices = find_devcon_devices(devcon_path, "Monitor");
 
       output_tree["configured"] = true;
       output_tree["devcon_path"] = devcon_path.string();
-      output_tree["devices"] = devices;
-      output_tree["device_count"] = devices.size();
-      
-      // Check if any devices are currently blocked by testing one
-      if (!devices.empty()) {
-        std::string test_cmd = std::format("\"{}\" status \"{}\"", devcon_path.string(), 
-                                           devices[0].value("vid_pattern", ""));
-        auto test_child = platf::run_command(true, false, test_cmd, {}, {}, nullptr, ec, nullptr);
-        if (!ec && test_child.valid()) {
-          test_child.wait();
-          // devcon returns 0 if device exists, non-zero if disabled/removed
-          output_tree["blocked"] = (test_child.exit_code() != 0);
+      output_tree["keyboard"] = keyboard_devices;
+      output_tree["mouse"] = mouse_devices;
+      output_tree["monitor"] = monitor_devices;
+      output_tree["keyboard_count"] = keyboard_devices.size();
+      output_tree["mouse_count"] = mouse_devices.size();
+      output_tree["monitor_count"] = monitor_devices.size();
+
+      // Check if devices are currently blocked
+      output_tree["blocked"] = false;
+      for (const auto &group : {keyboard_devices, mouse_devices}) {
+        if (!group.empty() && !output_tree["blocked"].get<bool>()) {
+          std::error_code ec;
+          boost::filesystem::path working_dir;
+          std::string test_cmd = std::format("\"{}\" status \"{}\"", devcon_path.string(),
+                                             group[0].value("vid_pattern", ""));
+          auto test_child = platf::run_command(true, false, test_cmd, working_dir, {}, nullptr, ec, nullptr);
+          if (!ec && test_child.valid()) {
+            test_child.wait();
+            if (test_child.exit_code() != 0) {
+              output_tree["blocked"] = true;
+            }
+          }
         }
       }
     } catch (const std::exception &e) {
@@ -1675,34 +1694,35 @@ namespace confighttp {
       std::vector<std::string> vid_patterns;
       nlohmann::json devices_blocked = nlohmann::json::array();
 
-      // Use provided vid_patterns from request, or auto-detect
-      if (request_body.contains("vid_patterns") && request_body["vid_patterns"].is_array()) {
+      // Collect patterns from categorized device IDs
+      auto collect_patterns = [&](const std::string &key) {
+        if (request_body.contains(key) && request_body[key].is_array()) {
+          for (const auto &p : request_body[key]) {
+            vid_patterns.push_back(p.get<std::string>());
+          }
+        }
+      };
+
+      collect_patterns("keyboard");
+      collect_patterns("mouse");
+      collect_patterns("monitor");
+
+      // Also accept flat vid_patterns for backward compat
+      if (vid_patterns.empty() && request_body.contains("vid_patterns") && request_body["vid_patterns"].is_array()) {
         for (const auto &pattern : request_body["vid_patterns"]) {
           vid_patterns.push_back(pattern.get<std::string>());
         }
       }
 
       if (vid_patterns.empty()) {
-        // Auto-detect: run devcon find *HID*
-        std::error_code ec;
-        std::string cmd = std::format("\"{}\" find \"*HID*\"", devcon_path.string());
-        auto child = platf::run_command(true, false, cmd, {}, {}, nullptr, ec, nullptr);
+        // Auto-detect keyboard, mouse, and monitor devices
+        auto kb = find_devcon_devices(devcon_path, "Keyboard");
+        auto ms = find_devcon_devices(devcon_path, "Mouse");
+        auto mon = find_devcon_devices(devcon_path, "Monitor");
 
-        if (!ec && child.valid() && child.std_out()) {
-          std::string line;
-          std::set<std::string> found_vids;
-          while (std::getline(*child.std_out(), line)) {
-            std::regex vid_regex("VID_([0-9A-Fa-f]{4})");
-            std::smatch match;
-            if (std::regex_search(line, match, vid_regex)) {
-              std::string vid = match[1].str();
-              if (found_vids.insert(vid).second) {
-                vid_patterns.push_back("*VID_" + vid + "*");
-              }
-            }
-          }
-          child.wait();
-        }
+        for (const auto &d : kb) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
+        for (const auto &d : ms) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
+        for (const auto &d : mon) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
       }
 
       if (vid_patterns.empty()) {
@@ -1714,8 +1734,9 @@ namespace confighttp {
       int blocked_count = 0;
       for (const auto &pattern : vid_patterns) {
         std::error_code ec;
+        boost::filesystem::path working_dir;
         std::string cmd = std::format("\"{}\" disable \"{}\"", devcon_path.string(), pattern);
-        auto child = platf::run_command(true, false, cmd, {}, {}, nullptr, ec, nullptr);
+        auto child = platf::run_command(true, false, cmd, working_dir, {}, nullptr, ec, nullptr);
 
         if (!ec && child.valid()) {
           child.wait();
@@ -1784,23 +1805,44 @@ namespace confighttp {
       std::vector<std::string> vid_patterns;
       nlohmann::json devices_unblocked = nlohmann::json::array();
 
-      // Use provided vid_patterns from request, or use catch-all *HID*
-      if (request_body.contains("vid_patterns") && request_body["vid_patterns"].is_array()) {
+      auto collect_patterns = [&](const std::string &key) {
+        if (request_body.contains(key) && request_body[key].is_array()) {
+          for (const auto &p : request_body[key]) {
+            vid_patterns.push_back(p.get<std::string>());
+          }
+        }
+      };
+
+      collect_patterns("keyboard");
+      collect_patterns("mouse");
+      collect_patterns("monitor");
+
+      if (vid_patterns.empty() && request_body.contains("vid_patterns") && request_body["vid_patterns"].is_array()) {
         for (const auto &pattern : request_body["vid_patterns"]) {
           vid_patterns.push_back(pattern.get<std::string>());
         }
       }
 
       if (vid_patterns.empty()) {
-        // Default: unblock all HID devices
+        auto kb = find_devcon_devices(devcon_path, "Keyboard");
+        auto ms = find_devcon_devices(devcon_path, "Mouse");
+        auto mon = find_devcon_devices(devcon_path, "Monitor");
+
+        for (const auto &d : kb) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
+        for (const auto &d : ms) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
+        for (const auto &d : mon) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
+      }
+
+      if (vid_patterns.empty()) {
         vid_patterns.push_back("*HID*");
       }
 
       int unblocked_count = 0;
       for (const auto &pattern : vid_patterns) {
         std::error_code ec;
+        boost::filesystem::path working_dir;
         std::string cmd = std::format("\"{}\" enable \"{}\"", devcon_path.string(), pattern);
-        auto child = platf::run_command(true, false, cmd, {}, {}, nullptr, ec, nullptr);
+        auto child = platf::run_command(true, false, cmd, working_dir, {}, nullptr, ec, nullptr);
 
         if (!ec && child.valid()) {
           child.wait();

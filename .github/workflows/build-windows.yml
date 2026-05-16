@@ -78,6 +78,7 @@ jobs:
             -G Ninja \
             -S . \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_DOCS=OFF \
             -DSUNSHINE_ASSETS_DIR=assets \
             -DSUNSHINE_PUBLISHER_NAME="LegionGames" \
             -DSUNSHINE_PUBLISHER_WEBSITE="https://legiongames.ru" \
