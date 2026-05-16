@@ -2,7 +2,7 @@ name: Build Windows (LegionGames)
 
 on:
   push:
-    branches: [master, legion-pairing-fix]
+    branches: [master, legiongames-sunshine]
   pull_request:
     branches: [master]
   workflow_dispatch:
