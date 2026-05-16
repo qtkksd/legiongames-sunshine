@@ -1550,13 +1550,30 @@ namespace confighttp {
     } else {
       cmd = std::format("\"{}\" find \"={}\"", devcon_path.string(), device_class);
     }
-    auto child = platf::run_command(true, false, cmd, working_dir, {}, nullptr, ec, nullptr);
-    if (ec || !child.valid() || !child.std_out()) {
+
+    FILE *tmp = std::tmpfile();
+    if (!tmp) {
       return devices;
     }
+
+    auto child = platf::run_command(true, false, cmd, working_dir, {}, tmp, ec, nullptr);
+    if (ec || !child.valid()) {
+      std::fclose(tmp);
+      return devices;
+    }
+
+    child.wait();
+    std::rewind(tmp);
+
     std::set<std::string> found_vids;
     std::string line;
-    while (std::getline(*child.std_out(), line)) {
+    char buffer[4096];
+    while (std::fgets(buffer, sizeof(buffer), tmp)) {
+      line = buffer;
+      while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+        line.pop_back();
+      }
+
       std::regex vid_regex("VID_([0-9A-Fa-f]{4})");
       std::smatch match;
       if (std::regex_search(line, match, vid_regex)) {
@@ -1577,7 +1594,7 @@ namespace confighttp {
         }
       }
     }
-    child.wait();
+    std::fclose(tmp);
     return devices;
   }
 #endif
@@ -1715,18 +1732,16 @@ namespace confighttp {
       }
 
       if (vid_patterns.empty()) {
-        // Auto-detect keyboard, mouse, and monitor devices
+        // Auto-detect keyboard and mouse only (monitor excluded from auto-block)
         auto kb = find_devcon_devices(devcon_path, "Keyboard");
         auto ms = find_devcon_devices(devcon_path, "Mouse");
-        auto mon = find_devcon_devices(devcon_path, "Monitor");
 
         for (const auto &d : kb) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
         for (const auto &d : ms) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
-        for (const auto &d : mon) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
       }
 
       if (vid_patterns.empty()) {
-        // Fallback: block all HID
+        // Fallback: disable all HID
         vid_patterns.push_back("*HID*");
       }
 
@@ -1824,13 +1839,12 @@ namespace confighttp {
       }
 
       if (vid_patterns.empty()) {
+        // Auto-detect keyboard and mouse only (monitor excluded from auto-unblock)
         auto kb = find_devcon_devices(devcon_path, "Keyboard");
         auto ms = find_devcon_devices(devcon_path, "Mouse");
-        auto mon = find_devcon_devices(devcon_path, "Monitor");
 
         for (const auto &d : kb) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
         for (const auto &d : ms) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
-        for (const auto &d : mon) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
       }
 
       if (vid_patterns.empty()) {
