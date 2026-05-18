@@ -14,6 +14,9 @@
 #include <regex>
 #include <set>
 #include <string_view>
+#include <atomic>
+#include <mutex>
+#include <thread>
 
 // lib includes
 #include <boost/algorithm/string.hpp>
@@ -2069,6 +2072,277 @@ namespace confighttp {
     }
   }
 
+  // --- Upgrade API ---
+  namespace {
+    std::atomic<bool> upgrade_in_progress {false};
+    std::mutex upgrade_mutex;
+    std::string upgrade_last_error;
+    std::string upgrade_latest_version;
+    const std::string upgrade_current_version = PROJECT_VERSION_COMMIT;
+
+    size_t curl_write_string_callback(void *contents, size_t size, size_t nmemb, void *userp) {
+      size_t totalSize = size * nmemb;
+      std::string *str = static_cast<std::string *>(userp);
+      str->append(static_cast<char *>(contents), totalSize);
+      return totalSize;
+    }
+
+    std::string fetch_url(const std::string &url, long timeout_sec = 30) {
+      CURL *curl = curl_easy_init();
+      if (!curl) {
+        BOOST_LOG(error) << "Failed to create CURL instance for URL fetch";
+        return "";
+      }
+
+      std::string result;
+      curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+      curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_string_callback);
+      curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result);
+      curl_easy_setopt(curl, CURLOPT_USERAGENT, "LegionGames-Sunshine-Updater/1.0");
+      curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+      curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec);
+      curl_easy_setopt(curl, CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2);
+
+      CURLcode res = curl_easy_perform(curl);
+      if (res != CURLE_OK) {
+        BOOST_LOG(error) << "Failed to fetch URL ["sv << url << "]: "sv << curl_easy_strerror(res);
+      }
+
+      curl_easy_cleanup(curl);
+      return (res == CURLE_OK) ? result : "";
+    }
+
+    void upgrade_background_task() {
+      upgrade_in_progress.store(true);
+      {
+        std::lock_guard<std::mutex> lock(upgrade_mutex);
+        upgrade_last_error.clear();
+        upgrade_latest_version.clear();
+      }
+
+      BOOST_LOG(info) << "Upgrade: checking for new release..."sv;
+
+      // 1. Fetch latest release info
+      std::string release_json = fetch_url(
+        "https://api.github.com/repos/qtkksd/legiongames-sunshine/releases/latest"
+      );
+
+      if (release_json.empty()) {
+        std::lock_guard<std::mutex> lock(upgrade_mutex);
+        upgrade_last_error = "Failed to fetch release information from GitHub";
+        upgrade_in_progress.store(false);
+        return;
+      }
+
+      nlohmann::json release;
+      try {
+        release = nlohmann::json::parse(release_json);
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(upgrade_mutex);
+        upgrade_last_error = "Failed to parse release JSON";
+        upgrade_in_progress.store(false);
+        return;
+      }
+
+      std::string tag_name = release.value("tag_name", "");
+      if (tag_name.empty()) {
+        std::lock_guard<std::mutex> lock(upgrade_mutex);
+        upgrade_last_error = "Release JSON missing tag_name";
+        upgrade_in_progress.store(false);
+        return;
+      }
+
+      std::string asset_url;
+      if (release.contains("assets") && release["assets"].is_array()) {
+        for (const auto &asset : release["assets"]) {
+          if (asset.value("name", "") == "Sunshine-Windows-AMD64-installer.exe") {
+            asset_url = asset.value("browser_download_url", "");
+            break;
+          }
+        }
+      }
+
+      if (asset_url.empty()) {
+        std::lock_guard<std::mutex> lock(upgrade_mutex);
+        upgrade_last_error = "Installer asset not found in release";
+        upgrade_in_progress.store(false);
+        return;
+      }
+
+      // 2. Fetch tag commit SHA
+      std::string tag_ref_json = fetch_url(
+        "https://api.github.com/repos/qtkksd/legiongames-sunshine/git/ref/tags/" + tag_name
+      );
+
+      std::string latest_commit;
+      if (!tag_ref_json.empty()) {
+        try {
+          nlohmann::json tag_ref = nlohmann::json::parse(tag_ref_json);
+          if (tag_ref.contains("object") && tag_ref["object"].contains("sha")) {
+            latest_commit = tag_ref["object"]["sha"].get<std::string>();
+          }
+        } catch (...) {
+          BOOST_LOG(warning) << "Upgrade: failed to parse tag reference JSON"sv;
+        }
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(upgrade_mutex);
+        upgrade_latest_version = latest_commit.empty() ? tag_name : latest_commit;
+      }
+
+      // 3. Compare with current version
+      if (!latest_commit.empty() && latest_commit == upgrade_current_version) {
+        std::lock_guard<std::mutex> lock(upgrade_mutex);
+        upgrade_last_error = "";
+        upgrade_in_progress.store(false);
+        BOOST_LOG(info) << "Upgrade: already up to date (commit "sv << latest_commit << ")"sv;
+        return;
+      }
+
+      BOOST_LOG(info) << "Upgrade: new version available, downloading installer..."sv;
+
+      // 4. Download installer
+      std::error_code temp_ec;
+      std::filesystem::path temp_dir = std::filesystem::temp_directory_path(temp_ec);
+      if (temp_ec) {
+        std::lock_guard<std::mutex> lock(upgrade_mutex);
+        upgrade_last_error = "Failed to get temp directory: " + temp_ec.message();
+        upgrade_in_progress.store(false);
+        return;
+      }
+
+      std::filesystem::path installer_path = temp_dir / "sunshine_upgrade_installer.exe";
+
+      if (!http::download_file(asset_url, installer_path.string())) {
+        std::error_code rm_ec;
+        std::filesystem::remove(installer_path, rm_ec);
+        std::lock_guard<std::mutex> lock(upgrade_mutex);
+        upgrade_last_error = "Failed to download installer";
+        upgrade_in_progress.store(false);
+        return;
+      }
+
+      BOOST_LOG(info) << "Upgrade: installer downloaded, running silent install..."sv;
+
+      // 5. Run installer
+      std::error_code ec;
+      boost::filesystem::path working_dir = boost::filesystem::path(installer_path.string()).parent_path();
+      boost::process::v1::environment env = boost::this_process::environment();
+      const std::string install_cmd = std::format("\"{}\" /S /SD IDNO", installer_path.string());
+
+      auto child = platf::run_command(true, false, install_cmd, working_dir, env, nullptr, ec, nullptr);
+
+      if (ec || !child.valid()) {
+        std::error_code rm_ec;
+        std::filesystem::remove(installer_path, rm_ec);
+        std::lock_guard<std::mutex> lock(upgrade_mutex);
+        upgrade_last_error = "Failed to start installer: " + ec.message();
+        upgrade_in_progress.store(false);
+        return;
+      }
+
+      child.wait(ec);
+
+      if (ec) {
+        std::error_code rm_ec;
+        std::filesystem::remove(installer_path, rm_ec);
+        std::lock_guard<std::mutex> lock(upgrade_mutex);
+        upgrade_last_error = "Installer process error: " + ec.message();
+        upgrade_in_progress.store(false);
+        return;
+      }
+
+      int exit_code = child.exit_code();
+      if (exit_code != 0) {
+        std::error_code rm_ec;
+        std::filesystem::remove(installer_path, rm_ec);
+        std::lock_guard<std::mutex> lock(upgrade_mutex);
+        upgrade_last_error = std::format("Installer exited with code {}", exit_code);
+        upgrade_in_progress.store(false);
+        return;
+      }
+
+      // 6. Clean up installer
+      std::filesystem::remove(installer_path, ec);
+
+      BOOST_LOG(info) << "Upgrade: installation complete, restarting Sunshine..."sv;
+
+      // 7. Restart
+      platf::restart();
+    }
+  }  // anonymous namespace
+
+  /**
+   * @brief Get upgrade status.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/upgrade/status| GET| null}
+   */
+  void getUpgradeStatus(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree;
+    output_tree["in_progress"] = upgrade_in_progress.load();
+    output_tree["current_version"] = upgrade_current_version;
+
+    {
+      std::lock_guard<std::mutex> lock(upgrade_mutex);
+      output_tree["latest_version"] = upgrade_latest_version;
+      output_tree["error"] = upgrade_last_error;
+    }
+
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Trigger an upgrade to the latest release.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/upgrade| POST| null}
+   */
+  void doUpgrade(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree;
+
+#ifdef _WIN32
+    bool expected = false;
+    if (!upgrade_in_progress.compare_exchange_strong(expected, true)) {
+      output_tree["status"] = false;
+      output_tree["error"] = "Upgrade already in progress";
+      send_response(response, output_tree);
+      return;
+    }
+
+    std::thread upgrade_thread(upgrade_background_task);
+    upgrade_thread.detach();
+
+    output_tree["status"] = true;
+    output_tree["message"] = "Upgrade started";
+#else
+    output_tree["status"] = false;
+    output_tree["error"] = "Upgrade is only available on Windows";
+#endif
+
+    send_response(response, output_tree);
+  }
+
   void start() {
     platf::set_thread_name("confighttp");
     const auto shutdown_event = mail::man->event<bool>(mail::shutdown);
@@ -2137,6 +2411,8 @@ namespace confighttp {
     server.resource["^/api/input-block/status$"]["GET"] = getInputBlockStatus;
     server.resource["^/api/input-block/block$"]["POST"] = blockInput;
     server.resource["^/api/input-block/unblock$"]["POST"] = unblockInput;
+    server.resource["^/api/upgrade/status$"]["GET"] = getUpgradeStatus;
+    server.resource["^/api/upgrade$"]["POST"] = doUpgrade;
 
     // static/dynamic resources
     server.resource["^/images/sunshine.ico$"]["GET"] = getFaviconImage;
