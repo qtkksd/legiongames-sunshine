@@ -1743,11 +1743,6 @@ namespace confighttp {
         for (const auto &d : ms) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
       }
 
-      if (vid_patterns.empty()) {
-        // Fallback: disable all HID
-        vid_patterns.push_back("*HID*");
-      }
-
       // Disable each device
       int blocked_count = 0;
       for (const auto &pattern : vid_patterns) {
@@ -1758,9 +1753,14 @@ namespace confighttp {
 
         if (!ec && child.valid()) {
           child.wait();
-          blocked_count++;
-          devices_blocked.push_back(pattern);
-          BOOST_LOG(info) << "Input block: disabled " << pattern;
+          int exit_code = child.exit_code();
+          if (exit_code == 0) {
+            blocked_count++;
+            devices_blocked.push_back(pattern);
+            BOOST_LOG(info) << "Input block: disabled " << pattern;
+          } else {
+            BOOST_LOG(warning) << "Input block: devcon disable failed (exit code " << exit_code << ") for " << pattern;
+          }
         }
       }
 
@@ -1842,16 +1842,7 @@ namespace confighttp {
       }
 
       if (vid_patterns.empty()) {
-        // Auto-detect keyboard and mouse only (monitor excluded from auto-unblock)
-        auto kb = find_devcon_devices(devcon_path, "Keyboard");
-        auto ms = find_devcon_devices(devcon_path, "Mouse");
-
-        for (const auto &d : kb) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
-        for (const auto &d : ms) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
-      }
-
-      if (vid_patterns.empty()) {
-        vid_patterns.push_back("*HID*");
+        vid_patterns.push_back("*");
       }
 
       int unblocked_count = 0;
