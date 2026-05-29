@@ -2103,7 +2103,7 @@ namespace confighttp {
       return (res == CURLE_OK) ? result : "";
     }
 
-    void upgrade_background_task() {
+    void upgrade_background_task(bool force) {
       upgrade_in_progress.store(true);
       {
         std::lock_guard<std::mutex> lock(upgrade_mutex);
@@ -2183,12 +2183,16 @@ namespace confighttp {
       }
 
       // 3. Compare with current version
-      if (!latest_commit.empty() && latest_commit == upgrade_current_version) {
+      if (!force && !latest_commit.empty() && latest_commit == upgrade_current_version) {
         std::lock_guard<std::mutex> lock(upgrade_mutex);
         upgrade_last_error = "";
         upgrade_in_progress.store(false);
         BOOST_LOG(info) << "Upgrade: already up to date (commit "sv << latest_commit << ")"sv;
         return;
+      }
+
+      if (force) {
+        BOOST_LOG(info) << "Upgrade: force flag set, skipping version check"sv;
       }
 
       BOOST_LOG(info) << "Upgrade: new version available, downloading installer..."sv;
@@ -2310,6 +2314,13 @@ namespace confighttp {
 
     print_req(request);
 
+    // Parse force flag from request body
+    bool force = false;
+    try {
+      auto body = nlohmann::json::parse(request->body);
+      force = body.value("force", false);
+    } catch (...) {}
+
     nlohmann::json output_tree;
 
 #ifdef _WIN32
@@ -2321,7 +2332,7 @@ namespace confighttp {
       return;
     }
 
-    std::thread upgrade_thread(upgrade_background_task);
+    std::thread upgrade_thread(upgrade_background_task, force);
     upgrade_thread.detach();
 
     output_tree["status"] = true;
