@@ -2317,7 +2317,7 @@ namespace confighttp {
     // Parse force flag from request body
     bool force = false;
     try {
-      auto body = nlohmann::json::parse(request->body);
+      auto body = nlohmann::json::parse(request->content.string());
       force = body.value("force", false);
     } catch (...) {}
 
