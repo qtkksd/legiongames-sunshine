@@ -41,6 +41,9 @@ on:
       AZURE_TENANT_ID:
         required: false
 
+env:
+  PYTHON_VERSION: '3.14'
+
 jobs:
   build_windows:
     name: ${{ matrix.name }}
@@ -66,13 +69,13 @@ jobs:
             toolchain: clang-aarch64
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
           submodules: recursive
 
       - name: Setup Dependencies Windows
         # if a dependency needs to be pinned, see https://github.com/LizardByte/build-deps/pull/186
-        uses: msys2/setup-msys2@e9898307ac31d1a803454791be09ab9973336e1c  # v2.31.1
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2.32.0
         with:
           msystem: ${{ matrix.msystem }}
           update: true
@@ -111,7 +114,6 @@ jobs:
             dependencies+=(
               "mingw-w64-${TOOLCHAIN}-MinHook"
               "mingw-w64-${TOOLCHAIN}-nsis"
-              "mingw-w64-${TOOLCHAIN}-nodejs"
             )
           fi
 
@@ -172,19 +174,16 @@ jobs:
           Remove-Item -Path doxygen-setup.exe
 
       - name: Setup dotnet  # needed for wix
-        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7  # v5.2.0
+        uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2  # v5.3.0
         with:
           dotnet-version: '10.x'
 
       - name: Setup NodeJS
-        # Clang compiled NodeJS has issues when running rollup webpack
-        if: matrix.msystem != 'ucrt64'
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
         with:
           node-version: 'lts/*'
 
       - name: NodeJS Path
-        if: matrix.msystem != 'ucrt64'
         shell: pwsh
         run: |
           # get NodeJS PATH
@@ -202,18 +201,22 @@ jobs:
         id: setup-python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
-          python-version: '3.14'
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Python Path
-        id: python-path
+      - name: Setup uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Sync Python tools
         shell: msys2 {0}
+        env:
+          MSYS2_PATH_TYPE: inherit
+          UV_PYTHON: ${{ steps.setup-python.outputs.python-path }}
         run: |
-          # replace backslashes with double backslashes
-          python_path=$(echo "${{ steps.setup-python.outputs.python-path }}" | sed 's/\\/\\\\/g')
-
-          # step output
-          echo "python-path=${python_path}"
-          echo "python-path=${python_path}" >> "${GITHUB_OUTPUT}"
+          uv sync --project third-party/lizardbyte-common --locked --only-group test-c \
+            --no-python-downloads \
+            --no-install-project
 
       - name: Build Windows
         shell: msys2 {0}
@@ -226,10 +229,8 @@ jobs:
           COMMIT: ${{ inputs.release_commit }}
         run: |
           # setup NodeJS PATH
-          if [[ "${MATRIX_MSYSTEM}" != "ucrt64" ]]; then
-            NODEJS_PATH=$(cygpath "$NODEJS_PATH")
-            export PATH="$PATH:$NODEJS_PATH"
-          fi
+          NODEJS_PATH=$(cygpath "$NODEJS_PATH")
+          export PATH="$PATH:$NODEJS_PATH"
 
           mkdir -p build
           cmake \
@@ -246,10 +247,54 @@ jobs:
           ninja -C build
           echo "::remove-matcher owner=gcc::"
 
+      - name: Check Windows linkage
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+
+          binaries=(
+            build/sunshine.exe
+            build/tools/audio-info.exe
+            build/tools/dxgi-info.exe
+            build/tools/sunshinesvc.exe
+            build/tests/test_sunshine.exe
+          )
+
+          unexpected_deps=""
+          for binary in "${binaries[@]}"; do
+            echo "::group::ldd ${binary}"
+            if ! linkage="$(ldd "${binary}")"; then
+              echo "${linkage}"
+              exit 1
+            fi
+            echo "${linkage}"
+            echo "::endgroup::"
+
+            unexpected_for_binary="$(awk '
+              BEGIN { IGNORECASE = 1 }
+              $1 == "zlib1.dll" { next }
+              $1 ~ /^minhook-detours\..*\.dll$/ { next }
+              $1 ~ /^api-ms-win-/ { next }
+              $1 ~ /^ext-ms-win-/ { next }
+              $0 ~ /=>[[:space:]]+not found/ { print }
+              $0 ~ /=>[[:space:]]+\/(clangarm64|clang64|mingw32|mingw64|ucrt64)\/bin\// { print }
+            ' <<< "${linkage}")"
+
+            if [[ -n "${unexpected_for_binary}" ]]; then
+              unexpected_deps="${unexpected_deps}"$'\n'"${binary}:"$'\n'"${unexpected_for_binary}"
+            fi
+          done
+
+          if [[ -n "${unexpected_deps}" ]]; then
+            echo "Unexpected non-packaged runtime dependencies were found:"
+            echo "${unexpected_deps}"
+            exit 1
+          fi
+
       - name: Sign Windows executables
         # ARM64 is not currently supported, see https://github.com/Azure/artifact-signing-action/issues/92
         if: inputs.publish_release == 'true' && inputs.azure_signing_account != '' && matrix.name != 'Windows-ARM64'
-        uses: azure/trusted-signing-action@b443cf8ea4124818d2ea9f043cba29fc3ec47b16  # v1.2.0
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82  # v2.0.0
         with:
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
@@ -285,7 +330,7 @@ jobs:
       - name: Sign Windows installers
         # ARM64 is not currently supported, see https://github.com/Azure/artifact-signing-action/issues/92
         if: inputs.publish_release == 'true' && inputs.azure_signing_account != '' && matrix.name != 'Windows-ARM64'
-        uses: azure/trusted-signing-action@b443cf8ea4124818d2ea9f043cba29fc3ec47b16  # v1.2.0
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82  # v2.0.0
         with:
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
@@ -321,9 +366,10 @@ jobs:
           (steps.test.outcome == 'success' || steps.test.outcome == 'failure')
         shell: msys2 {0}
         working-directory: build
+        env:
+          MSYS2_PATH_TYPE: inherit
         run: |
-          ${{ steps.python-path.outputs.python-path }} -m pip install "..[test]"
-          ${{ steps.python-path.outputs.python-path }} -m gcovr . -r ../src \
+          uv run --project ../third-party/lizardbyte-common --locked --no-sync gcovr . -r ../src \
             --exclude-noncode-lines \
             --exclude-throw-branches \
             --exclude-unreachable-branches \

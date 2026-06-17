@@ -3,6 +3,13 @@ cmake_minimum_required(VERSION 3.13)
 
 project(test_sunshine)
 
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT DEFINED CMAKE_CUDA_STANDARD)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+endif()
+
 include_directories("${CMAKE_SOURCE_DIR}")
 
 enable_testing()
@@ -150,8 +157,6 @@ endforeach()
 
 # Ensure locale files are synchronized before building the test executable
 add_dependencies(${PROJECT_NAME} sync_locale_files)
-
-set_target_properties(${PROJECT_NAME} PROPERTIES CXX_STANDARD 23)
 
 # Build the list of libraries to link
 set(TEST_LINK_LIBRARIES

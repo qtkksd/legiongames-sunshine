@@ -26,20 +26,21 @@ pkg install -y \
   devel/cmake \
   devel/evdev-proto \
   devel/git \
-  devel/libayatana-appindicator \
   devel/libevdev \
   devel/libnotify \
   devel/ninja \
   devel/pkgconf \
+  devel/qt6-base \
   ftp/curl \
   graphics/libdrm \
+  graphics/qt6-svg \
   graphics/wayland \
   multimedia/libva \
   net/miniupnpc \
   ports-mgmt/pkg \
   security/openssl \
   shells/bash \
-  www/npm \
+  www/npm-node22 \
   x11/libX11 \
   x11/libxcb \
   x11/libXfixes \
@@ -69,7 +70,7 @@ Sunshine requires CUDA Toolkit for NVFBC capture. There are two caveats to CUDA:
 
 1. The version installed depends on the version of GCC.
 2. The version of CUDA you use will determine compatibility with various GPU generations.
-   At the time of writing, the recommended version to use is CUDA ~12.9.
+   At the time of writing, the recommended version to use is CUDA ~13.1.
    See [CUDA compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/index.html) for more info.
 
 > [!NOTE]

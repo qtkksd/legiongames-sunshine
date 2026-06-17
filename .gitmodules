@@ -2,10 +2,6 @@
 	path = packaging/linux/flatpak/deps/flatpak-builder-tools
 	url = https://github.com/flatpak/flatpak-builder-tools.git
 	branch = master
-[submodule "packaging/linux/flatpak/deps/shared-modules"]
-	path = packaging/linux/flatpak/deps/shared-modules
-	url = https://github.com/flathub/shared-modules.git
-	branch = master
 [submodule "third-party/build-deps"]
 	path = third-party/build-deps
 	url = https://github.com/LizardByte/build-deps.git
@@ -29,6 +25,10 @@
 	path = third-party/libdisplaydevice
 	url = https://github.com/LizardByte/libdisplaydevice.git
 	branch = master
+[submodule "third-party/lizardbyte-common"]
+	path = third-party/lizardbyte-common
+	url = https://github.com/LizardByte/lizardbyte-common.git
+	branch = master
 [submodule "third-party/moonlight-common-c"]
 	path = third-party/moonlight-common-c
 	url = https://github.com/moonlight-stream/moonlight-common-c.git
@@ -45,6 +45,10 @@
 	path = third-party/nvapi
 	url = https://github.com/NVIDIA/nvapi.git
 	branch = main
+[submodule "third-party/plasma-wayland-protocols"]
+	path = third-party/plasma-wayland-protocols
+	url = https://github.com/KDE/plasma-wayland-protocols.git
+	branch = master
 [submodule "third-party/Simple-Web-Server"]
 	path = third-party/Simple-Web-Server
 	url = https://github.com/LizardByte-infrastructure/Simple-Web-Server.git

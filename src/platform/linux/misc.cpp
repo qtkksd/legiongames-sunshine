@@ -445,8 +445,22 @@ namespace platf {
     lifetime::exit_sunshine(0, true);
   }
 
+  std::string get_env(const std::string &name) {
+    if (const auto value = getenv(name.c_str()); value != nullptr) {
+      return value;
+    }
+    return "";
+  }
+
   int set_env(const std::string &name, const std::string &value) {
     return setenv(name.c_str(), value.c_str(), 1);
+  }
+
+  int append_env(const std::string &name, const std::string &value, const std::string &separator) {
+    if (const std::string old_value = get_env(name); !old_value.contains(value)) {
+      return set_env(name, old_value.empty() ? value : old_value + separator + value);
+    }
+    return 0;
   }
 
   int unset_env(const std::string &name) {
@@ -963,6 +977,9 @@ namespace platf {
 #ifdef SUNSHINE_BUILD_X11
       X11,  ///< X11
 #endif
+#ifdef SUNSHINE_BUILD_KWIN
+      KWIN,  ///< KWin ScreenCast
+#endif
 #ifdef SUNSHINE_BUILD_PORTAL
       PORTAL,  ///< XDG PORTAL
 #endif
@@ -1017,6 +1034,17 @@ namespace platf {
   }
 #endif
 
+#ifdef SUNSHINE_BUILD_KWIN
+  bool kwin_available();
+  std::vector<std::string> kwin_display_names();
+  std::shared_ptr<display_t> kwin_display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config);
+
+  bool verify_kwin() {
+    // Note: The separate kwin_available check is necessary because with CAP_SYS_ADMIN kwin_display_names is never empty during startup
+    return window_system == window_system_e::WAYLAND && kwin_available() && !kwin_display_names().empty();
+  }
+#endif
+
   std::vector<std::string> display_names(mem_type_e hwdevice_type) {
 #ifdef SUNSHINE_BUILD_CUDA
     // display using NvFBC only supports mem_type_e::cuda
@@ -1044,6 +1072,11 @@ namespace platf {
       return portal_display_names();
     }
 #endif
+#ifdef SUNSHINE_BUILD_KWIN
+    if (sources[source::KWIN]) {
+      return kwin_display_names();
+    }
+#endif
     return {};
   }
 
@@ -1057,6 +1090,19 @@ namespace platf {
   }
 
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
+    // Keep KMS as first element to check before dropping CAP_SYS_ADMIN
+#ifdef SUNSHINE_BUILD_DRM
+    if (sources[source::KMS]) {
+      BOOST_LOG(info) << "Screencasting with KMS"sv;
+      return kms_display(hwdevice_type, display_name, config);
+    }
+#endif
+
+    // KMS capture was passed; drop CAP_SYS_ADMIN only.
+    if (has_elevated_privileges(false)) {
+      drop_elevated_privileges(false);
+    }
+
 #ifdef SUNSHINE_BUILD_CUDA
     if (sources[source::NVFBC] && hwdevice_type == mem_type_e::cuda) {
       BOOST_LOG(info) << "Screencasting with NvFBC"sv;
@@ -1067,12 +1113,6 @@ namespace platf {
     if (sources[source::WAYLAND]) {
       BOOST_LOG(info) << "Screencasting with Wayland's protocol"sv;
       return wl_display(hwdevice_type, display_name, config);
-    }
-#endif
-#ifdef SUNSHINE_BUILD_DRM
-    if (sources[source::KMS]) {
-      BOOST_LOG(info) << "Screencasting with KMS"sv;
-      return kms_display(hwdevice_type, display_name, config);
     }
 #endif
 #ifdef SUNSHINE_BUILD_X11
@@ -1087,6 +1127,12 @@ namespace platf {
       return portal_display(hwdevice_type, display_name, config);
     }
 #endif
+#ifdef SUNSHINE_BUILD_KWIN
+    if (sources[source::KWIN]) {
+      BOOST_LOG(info) << "Screencasting with KWin ScreenCast"sv;
+      return kwin_display(hwdevice_type, display_name, config);
+    }
+#endif
 
     return nullptr;
   }
@@ -1098,6 +1144,8 @@ namespace platf {
 
     // enable Vulkan video extensions for AMD RADV
     set_env("RADV_PERFTEST", "video_encode");
+    // Above is deprecated on Mesa 26.1+ and replaced by (keep both to ensure best compatibility):
+    append_env("RADV_EXPERIMENTAL", "video_encode", ",");
 
     // These are allowed to fail.
     gbm::init();
@@ -1143,6 +1191,11 @@ namespace platf {
 #ifdef SUNSHINE_BUILD_PORTAL
     if ((config::video.capture.empty() || config::video.capture == "portal") && verify_portal()) {
       sources[source::PORTAL] = true;
+    }
+#endif
+#ifdef SUNSHINE_BUILD_KWIN
+    if (((config::video.capture.empty() && sources.none()) || config::video.capture == "kwin") && verify_kwin()) {
+      sources[source::KWIN] = true;
     }
 #endif
 
@@ -1231,18 +1284,22 @@ namespace platf {
   }
 
 #if !defined(__FreeBSD__)
-  constexpr std::array<cap_value_t, 2> ELEVATED_PRIVILEGES_EFFECTIVE {CAP_SYS_ADMIN, CAP_SYS_NICE};
-  constexpr std::array<cap_value_t, 2> ELEVATED_PRIVILEGES_PERMITTED {CAP_SYS_ADMIN, CAP_SYS_NICE};
+  static constexpr cap_value_t FULL_CAPS[] = {CAP_SYS_ADMIN, CAP_SYS_NICE};
+  static constexpr cap_value_t ADMIN_CAPS[] = {CAP_SYS_ADMIN};
+
+  constexpr std::span<const cap_value_t> ELEVATED_PRIVILEGES_FULL {FULL_CAPS};
+  constexpr std::span<const cap_value_t> ELEVATED_PRIVILEGES_ADMIN {ADMIN_CAPS};
 #endif
 
-  bool has_elevated_privileges() {
+  bool has_elevated_privileges(bool all_caps) {
 #if !defined(__FreeBSD__)
+    const auto caps_to_check = all_caps ? ELEVATED_PRIVILEGES_FULL : ELEVATED_PRIVILEGES_ADMIN;
     const cap_t caps = cap_get_proc();
     if (!caps) {
       BOOST_LOG(error) << "[misc] has_elevated_privileges failed to get process capabilities."sv;
       return false;
     }
-    for (const auto c : ELEVATED_PRIVILEGES_EFFECTIVE) {
+    for (const auto c : caps_to_check) {
       cap_flag_value_t cap_flags_value;
       cap_get_flag(caps, c, CAP_EFFECTIVE, &cap_flags_value);
       if (cap_flags_value == CAP_SET) {
@@ -1250,7 +1307,7 @@ namespace platf {
         return true;
       }
     }
-    for (const auto c : ELEVATED_PRIVILEGES_PERMITTED) {
+    for (const auto c : caps_to_check) {
       cap_flag_value_t cap_flags_value;
       cap_get_flag(caps, c, CAP_PERMITTED, &cap_flags_value);
       if (cap_flags_value == CAP_SET) {
@@ -1263,17 +1320,18 @@ namespace platf {
     return false;
   }
 
-  void drop_elevated_privileges() {
+  void drop_elevated_privileges(bool all_caps) {
 #if !defined(__FreeBSD__)
     bool failed = false;
+    const auto caps_to_drop = all_caps ? ELEVATED_PRIVILEGES_FULL : ELEVATED_PRIVILEGES_ADMIN;
     const cap_t caps = cap_get_proc();
     if (!caps) {
       BOOST_LOG(error) << "[misc] drop_elevated_privileges failed to get process capabilities"sv;
       return;
     }
 
-    cap_set_flag(caps, CAP_EFFECTIVE, ELEVATED_PRIVILEGES_EFFECTIVE.size(), ELEVATED_PRIVILEGES_EFFECTIVE.data(), CAP_CLEAR);
-    cap_set_flag(caps, CAP_PERMITTED, ELEVATED_PRIVILEGES_PERMITTED.size(), ELEVATED_PRIVILEGES_PERMITTED.data(), CAP_CLEAR);
+    cap_set_flag(caps, CAP_EFFECTIVE, caps_to_drop.size(), caps_to_drop.data(), CAP_CLEAR);
+    cap_set_flag(caps, CAP_PERMITTED, caps_to_drop.size(), caps_to_drop.data(), CAP_CLEAR);
 
     if (cap_set_proc(caps) != 0) {
       BOOST_LOG(error) << "[misc] drop_elevated_privileges failed to prune capabilities: "sv << std::strerror(errno);

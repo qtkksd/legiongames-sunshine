@@ -887,7 +887,10 @@ namespace confighttp {
       output_tree["status"] = nvhttp::set_client_enabled(uuid, enabled);
 
       if (!enabled && output_tree["status"]) {
-        rtsp_stream::terminate_sessions();
+        auto cert = nvhttp::get_cert_by_uuid(uuid);
+        if (!cert.empty()) {
+          rtsp_stream::terminate_sessions_by_cert(cert);
+        }
 
         if (rtsp_stream::session_count() == 0 && proc::proc.running() > 0) {
           proc::proc.terminate();
@@ -1488,8 +1491,8 @@ namespace confighttp {
     nlohmann::json output_tree;
 
 #ifdef _WIN32
-    // Get the path to the vigembus installer
-    const std::filesystem::path installer_path = platf::appdata().parent_path() / "scripts" / "vigembus_installer.exe";
+    // Get the path to the packaged ViGEmBus installer.
+    const std::filesystem::path installer_path = platf::appdata().parent_path() / "third-party" / "vigembus_installer.exe";
 
     if (!std::filesystem::exists(installer_path)) {
       output_tree["status"] = false;
@@ -2382,6 +2385,7 @@ namespace confighttp {
     server.resource["^/clients/?$"]["GET"] = page_handler("clients.html");
     server.resource["^/config/?$"]["GET"] = page_handler("config.html");
     server.resource["^/featured/?$"]["GET"] = page_handler("featured.html");
+    server.resource["^/logout/?$"]["GET"] = page_handler("logout.html", false);
     server.resource["^/password/?$"]["GET"] = page_handler("password.html");
     server.resource["^/pin/?$"]["GET"] = page_handler("pin.html");
     server.resource["^/troubleshooting/?$"]["GET"] = page_handler("troubleshooting.html");
@@ -2425,11 +2429,15 @@ namespace confighttp {
     server.config.address = net::get_bind_address(address_family);
     server.config.port = port_https;
 
+    // Store bind address for logging, use "localhost" as fallback for wildcard addresses
+    const auto bind_addr = server.config.address;
+    const auto display_addr = config::sunshine.bind_address.empty() ? "localhost"sv : std::string_view {bind_addr};
+
     auto accept_and_run = [&](auto *server) {
       try {
         platf::set_thread_name("confighttp::tcp");
-        server->start([](const unsigned short port) {
-          BOOST_LOG(info) << "Configuration UI available at [https://localhost:"sv << port << "]";
+        server->start([&display_addr](const unsigned short port) {
+          BOOST_LOG(info) << "Configuration UI available at [https://"sv << display_addr << ":" << port << "]";
         });
       } catch (boost::system::system_error &err) {
         // It's possible the exception gets thrown after calling server->stop() from a different thread

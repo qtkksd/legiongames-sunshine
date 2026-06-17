@@ -2,6 +2,10 @@
 
 if(FREEBSD)
     add_compile_definitions(SUNSHINE_PLATFORM="freebsd")
+    # FreeBSD installs packages to /usr/local/lib, which is not in the default linker search path.
+    # link_directories() is directory-scoped and propagates to all subdirectories (including tests/),
+    # so all targets (sunshine, test_sunshine) can resolve libraries found via pkg_check_modules.
+    link_directories(/usr/local/lib)
 else()
     add_compile_definitions(SUNSHINE_PLATFORM="linux")
 endif()
@@ -76,8 +80,8 @@ if(CUDA_FOUND)
     add_compile_definitions(SUNSHINE_BUILD_CUDA)
 endif()
 
-# libdrm is required for both DRM (KMS) and Wayland
-if(${SUNSHINE_ENABLE_DRM} OR ${SUNSHINE_ENABLE_WAYLAND})
+# libdrm is required for DRM (KMS), KWin ScreenCast and Wayland
+if(${SUNSHINE_ENABLE_DRM} OR ${SUNSHINE_ENABLE_KWIN} OR ${SUNSHINE_ENABLE_WAYLAND})
     find_package(LIBDRM REQUIRED)
 else()
     set(LIBDRM_FOUND OFF)
@@ -122,8 +126,14 @@ endif()
 
 # vulkan video encoding (via FFmpeg)
 if(${SUNSHINE_ENABLE_VULKAN})
-    # use Vulkan headers from build-deps submodule (system headers may be too old, e.g. Ubuntu 22.04)
-    set(VULKAN_HEADERS_DIR "${CMAKE_SOURCE_DIR}/third-party/build-deps/third-party/FFmpeg/Vulkan-Headers/include")
+    if(NOT SUNSHINE_SYSTEM_VULKAN_HEADERS)
+        # use Vulkan headers from build-deps submodule (system headers may be too old, e.g. Ubuntu 22.04)
+        set(VULKAN_HEADERS_DIR "${CMAKE_SOURCE_DIR}/third-party/build-deps/third-party/FFmpeg/Vulkan-Headers/include")
+    else()
+        find_package(VulkanHeaders REQUIRED)
+        get_target_property(VULKAN_HEADERS_DIR Vulkan::Headers INTERFACE_INCLUDE_DIRECTORIES)
+    endif()
+
     if(NOT EXISTS "${VULKAN_HEADERS_DIR}/vulkan/vulkan.h")
         message(FATAL_ERROR "Vulkan headers not found in build-deps submodule")
     endif()
@@ -243,7 +253,7 @@ if(GIO_FOUND)
 endif()
 
 # Pipewire
-if(${SUNSHINE_ENABLE_PORTAL})
+if(${SUNSHINE_ENABLE_KWIN} OR ${SUNSHINE_ENABLE_PORTAL})
     pkg_check_modules(PIPEWIRE libpipewire-0.3 REQUIRED)
 else()
     set(PIPEWIRE_FOUND OFF)
@@ -264,44 +274,27 @@ if(PIPEWIRE_FOUND AND GIO_FOUND AND ${SUNSHINE_ENABLE_PORTAL})
             "${CMAKE_SOURCE_DIR}/src/platform/linux/portalgrab.cpp")
 endif()
 
-if(NOT ${CUDA_FOUND}
-        AND NOT ${WAYLAND_FOUND}
-        AND NOT ${X11_FOUND}
-        AND NOT ${PORTAL_FOUND}
-        AND NOT (${LIBDRM_FOUND} AND ${LIBCAP_FOUND})
-        AND NOT ${LIBVA_FOUND})
-    message(FATAL_ERROR "Couldn't find either cuda, libva, pipewire, wayland, x11, or (libdrm and libcap)")
+# KWin ScreenCast (direct Wayland protocol, bypasses portal)
+set(KWIN_FOUND OFF)
+if(PIPEWIRE_FOUND AND WAYLAND_FOUND AND ${SUNSHINE_ENABLE_KWIN})
+    set(KWIN_FOUND ON)
+    add_compile_definitions(SUNSHINE_BUILD_KWIN)
+    GEN_WAYLAND("${CMAKE_SOURCE_DIR}/third-party/plasma-wayland-protocols/src/protocols" "" kde-output-order-v1)
+    GEN_WAYLAND("${CMAKE_SOURCE_DIR}/third-party/plasma-wayland-protocols/src/protocols" "" zkde-screencast-unstable-v1)
+    list(APPEND PLATFORM_TARGET_FILES
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/kwingrab.cpp")
+elseif(${SUNSHINE_ENABLE_KWIN} AND NOT WAYLAND_FOUND)
+    message(FATAL_ERROR "SUNSHINE_ENABLE_KWIN requires SUNSHINE_ENABLE_WAYLAND — KWin capture disabled")
 endif()
 
-# tray icon
-if(${SUNSHINE_ENABLE_TRAY})
-    pkg_check_modules(APPINDICATOR ayatana-appindicator3-0.1)
-    if(APPINDICATOR_FOUND)
-        list(APPEND SUNSHINE_DEFINITIONS TRAY_AYATANA_APPINDICATOR=1)
-    else()
-        pkg_check_modules(APPINDICATOR appindicator3-0.1)
-        if(APPINDICATOR_FOUND)
-            list(APPEND SUNSHINE_DEFINITIONS TRAY_LEGACY_APPINDICATOR=1)
-        endif ()
-    endif()
-    pkg_check_modules(LIBNOTIFY libnotify)
-    if(NOT APPINDICATOR_FOUND OR NOT LIBNOTIFY_FOUND)
-        message(STATUS "APPINDICATOR_FOUND: ${APPINDICATOR_FOUND}")
-        message(STATUS "LIBNOTIFY_FOUND: ${LIBNOTIFY_FOUND}")
-        message(FATAL_ERROR "Couldn't find either appindicator or libnotify")
-    else()
-        include_directories(SYSTEM ${APPINDICATOR_INCLUDE_DIRS} ${LIBNOTIFY_INCLUDE_DIRS})
-        link_directories(${APPINDICATOR_LIBRARY_DIRS} ${LIBNOTIFY_LIBRARY_DIRS})
-
-        list(APPEND PLATFORM_TARGET_FILES "${CMAKE_SOURCE_DIR}/third-party/tray/src/tray_linux.c")
-        list(APPEND SUNSHINE_EXTERNAL_LIBRARIES ${APPINDICATOR_LIBRARIES} ${LIBNOTIFY_LIBRARIES})
-    endif()
-
-    set(SUNSHINE_TRAY_PREFIX "${PROJECT_FQDN}")
-    list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_TRAY_PREFIX="${SUNSHINE_TRAY_PREFIX}")
-else()
-    set(SUNSHINE_TRAY 0)
-    message(STATUS "Tray icon disabled")
+if(NOT ${CUDA_FOUND}
+        AND NOT (${LIBDRM_FOUND} AND ${LIBCAP_FOUND})
+        AND NOT ${LIBVA_FOUND}
+        AND NOT ${KWIN_FOUND}
+        AND NOT ${PORTAL_FOUND}
+        AND NOT ${WAYLAND_FOUND}
+        AND NOT ${X11_FOUND})
+    message(FATAL_ERROR "Couldn't find either cuda, (libdrm and libcap), libva, kwin, pipewire, portal, wayland or x11")
 endif()
 
 # These need to be set before adding the inputtino subdirectory in order for them to be picked up
