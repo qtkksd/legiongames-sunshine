@@ -2074,6 +2074,9 @@ namespace confighttp {
     std::string upgrade_latest_version;
     const std::string upgrade_current_version = PROJECT_VERSION_COMMIT;
 
+    std::atomic<bool> netbird_update_in_progress {false};
+    std::string netbird_update_error;
+
     size_t curl_write_string_callback(void *contents, size_t size, size_t nmemb, void *userp) {
       size_t totalSize = size * nmemb;
       std::string *str = static_cast<std::string *>(userp);
@@ -2269,6 +2272,71 @@ namespace confighttp {
       // 7. Restart
       platf::restart();
     }
+
+    void netbird_update_background_task() {
+      netbird_update_in_progress.store(true);
+      netbird_update_error.clear();
+
+      BOOST_LOG(info) << "NetBird update: downloading installer..."sv;
+
+      // 1. Download installer
+      std::error_code ec;
+      std::filesystem::path temp_dir = std::filesystem::temp_directory_path(ec);
+      if (ec) {
+        netbird_update_error = "Failed to get temp directory: " + ec.message();
+        netbird_update_in_progress.store(false);
+        return;
+      }
+
+      std::filesystem::path installer_path = temp_dir / "netbird_update_installer.exe";
+
+      if (!http::download_file("https://pkgs.legiongames.ru/latest/windows/x64/netbird.exe", installer_path.string())) {
+        std::filesystem::remove(installer_path, ec);
+        netbird_update_error = "Failed to download NetBird installer";
+        netbird_update_in_progress.store(false);
+        return;
+      }
+
+      // 2. Stop NetBird service (ignore errors if not running)
+      ec.clear();
+      boost::filesystem::path working_dir;
+      auto stop_child = platf::run_command(true, false, "net stop \"netbird\"", working_dir, {}, nullptr, ec, nullptr);
+      if (!ec && stop_child.valid()) {
+        stop_child.wait();
+      }
+
+      BOOST_LOG(info) << "NetBird update: running silent install..."sv;
+
+      // 3. Run installer
+      ec.clear();
+      boost::filesystem::path install_working_dir = boost::filesystem::path(installer_path.string()).parent_path();
+      boost::process::v1::environment env = boost::this_process::environment();
+      const std::string install_cmd = std::format("\"{}\" /S /SD IDNO", installer_path.string());
+
+      auto child = platf::run_command(true, false, install_cmd, install_working_dir, env, nullptr, ec, nullptr);
+
+      if (ec || !child.valid()) {
+        std::filesystem::remove(installer_path, ec);
+        netbird_update_error = "Failed to start NetBird installer: " + ec.message();
+        netbird_update_in_progress.store(false);
+        return;
+      }
+
+      child.wait(ec);
+
+      // 4. Start NetBird service
+      ec.clear();
+      auto start_child = platf::run_command(true, false, "net start \"netbird\"", working_dir, {}, nullptr, ec, nullptr);
+      if (!ec && start_child.valid()) {
+        start_child.wait();
+      }
+
+      // 5. Cleanup
+      std::filesystem::remove(installer_path, ec);
+
+      netbird_update_in_progress.store(false);
+      BOOST_LOG(info) << "NetBird update: complete"sv;
+    }
   }  // anonymous namespace
 
   /**
@@ -2348,6 +2416,70 @@ namespace confighttp {
     send_response(response, output_tree);
   }
 
+  /**
+   * @brief Get NetBird update status.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/update-netbird/status| GET| null}
+   */
+  void getNetBirdUpdateStatus(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree;
+    output_tree["in_progress"] = netbird_update_in_progress.load();
+    output_tree["error"] = netbird_update_error;
+
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Update NetBird client to the latest version.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/update-netbird| POST| null}
+   */
+  void doNetBirdUpdate(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree;
+
+#ifdef _WIN32
+    bool expected = false;
+    if (!netbird_update_in_progress.compare_exchange_strong(expected, true)) {
+      output_tree["status"] = false;
+      output_tree["error"] = "NetBird update already in progress";
+      send_response(response, output_tree);
+      return;
+    }
+
+    std::thread update_thread(netbird_update_background_task);
+    update_thread.detach();
+
+    output_tree["status"] = true;
+    output_tree["message"] = "NetBird update started";
+#else
+    output_tree["status"] = false;
+    output_tree["error"] = "NetBird update is only available on Windows";
+#endif
+
+    send_response(response, output_tree);
+  }
+
   void start() {
     platf::set_thread_name("confighttp");
     const auto shutdown_event = mail::man->event<bool>(mail::shutdown);
@@ -2419,6 +2551,8 @@ namespace confighttp {
     server.resource["^/api/input-block/unblock$"]["POST"] = unblockInput;
     server.resource["^/api/upgrade/status$"]["GET"] = getUpgradeStatus;
     server.resource["^/api/upgrade$"]["POST"] = doUpgrade;
+    server.resource["^/api/update-netbird/status$"]["GET"] = getNetBirdUpdateStatus;
+    server.resource["^/api/update-netbird$"]["POST"] = doNetBirdUpdate;
 
     // static/dynamic resources
     server.resource["^/images/sunshine.ico$"]["GET"] = getFaviconImage;
