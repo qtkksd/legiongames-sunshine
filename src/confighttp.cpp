@@ -2504,6 +2504,180 @@ namespace confighttp {
     send_response(response, output_tree);
   }
 
+#ifdef _WIN32
+  /**
+   * @brief Run the DiskGuard helper (lgd.exe) shipped next to sunshine.exe and
+   * parse its JSON stdout.
+   * @param args Command line arguments for lgd.exe (e.g. "status").
+   * @param out Parsed JSON output.
+   * @param error Error message when the call fails.
+   * @return True when lgd.exe exited 0 and produced parseable JSON.
+   */
+  bool run_diskguard(const std::string &args, nlohmann::json &out, std::string &error) {
+    const std::filesystem::path exe = platf::appdata().parent_path() / "lgd.exe";
+    if (!std::filesystem::exists(exe)) {
+      error = "lgd.exe not found next to Sunshine: " + exe.string();
+      return false;
+    }
+
+    std::error_code ec;
+    boost::filesystem::path working_dir;
+    const std::string cmd = std::format("\"{}\" {}", exe.string(), args);
+
+    FILE *tmp = std::tmpfile();
+    if (!tmp) {
+      error = "tmpfile() failed";
+      return false;
+    }
+
+    auto child = platf::run_command(true, false, cmd, working_dir, {}, tmp, ec, nullptr);
+    if (ec || !child.valid()) {
+      std::fclose(tmp);
+      error = "failed to start lgd.exe: " + ec.message();
+      return false;
+    }
+
+    child.wait();
+    const int exit_code = child.exit_code();
+    std::rewind(tmp);
+
+    std::string content;
+    char buffer[4096];
+    while (std::fgets(buffer, sizeof(buffer), tmp)) {
+      content += buffer;
+    }
+    std::fclose(tmp);
+
+    if (!content.empty()) {
+      BOOST_LOG(info) << "DiskGuard [" << args << "] exit=" << exit_code << " out=" << content;
+    }
+
+    try {
+      out = nlohmann::json::parse(content);
+    } catch (...) {
+      out = nlohmann::json::object();
+      out["raw"] = content;
+    }
+
+    if (exit_code != 0) {
+      if (out.is_object() && out.contains("error") && out["error"].is_string()) {
+        error = out["error"].get<std::string>();
+      } else {
+        error = std::format("lgd.exe {} failed (exit {})", args, exit_code);
+      }
+      return false;
+    }
+    return true;
+  }
+#endif
+
+  /**
+   * @brief Get DiskGuard status (version, last snapshot, shadows).
+   * @api_examples{/api/diskguard/status| GET| null}
+   */
+  void getDiskGuardStatus(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree;
+#ifdef _WIN32
+    std::string error;
+    if (!run_diskguard("status", output_tree, error)) {
+      output_tree = {{"status", false}, {"error", error}};
+    }
+#else
+    output_tree = {{"status", false}, {"error", "DiskGuard is only available on Windows"}};
+#endif
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Create a new DiskGuard gold snapshot.
+   * @api_examples{/api/diskguard/snapshot| POST| null}
+   */
+  void doDiskGuardSnapshot(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree;
+#ifdef _WIN32
+    std::string error;
+    if (!run_diskguard("snapshot", output_tree, error)) {
+      output_tree = {{"status", false}, {"error", error}};
+    }
+#else
+    output_tree = {{"status", false}, {"error", "DiskGuard is only available on Windows"}};
+#endif
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Revert the protected volume to the gold snapshot.
+   * @api_examples{/api/diskguard/revert| POST| null}
+   */
+  void doDiskGuardRevert(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree;
+#ifdef _WIN32
+    std::string error;
+    if (!run_diskguard("revert", output_tree, error)) {
+      output_tree = {{"status", false}, {"error", error}};
+    }
+#else
+    output_tree = {{"status", false}, {"error", "DiskGuard is only available on Windows"}};
+#endif
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Self-update the DiskGuard binary.
+   * @api_examples{/api/diskguard/update| POST| null}
+   */
+  void doDiskGuardUpdate(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree;
+#ifdef _WIN32
+    std::string error;
+    if (!run_diskguard("update", output_tree, error)) {
+      output_tree = {{"status", false}, {"error", error}};
+    }
+#else
+    output_tree = {{"status", false}, {"error", "DiskGuard is only available on Windows"}};
+#endif
+    send_response(response, output_tree);
+  }
+
   /**
    * @brief Start the HTTPS configuration server.
    */
@@ -2580,6 +2754,10 @@ namespace confighttp {
     server.resource["^/api/upgrade$"]["POST"] = doUpgrade;
     server.resource["^/api/update-netbird/status$"]["GET"] = getNetBirdUpdateStatus;
     server.resource["^/api/update-netbird$"]["POST"] = doNetBirdUpdate;
+    server.resource["^/api/diskguard/status$"]["GET"] = getDiskGuardStatus;
+    server.resource["^/api/diskguard/snapshot$"]["POST"] = doDiskGuardSnapshot;
+    server.resource["^/api/diskguard/revert$"]["POST"] = doDiskGuardRevert;
+    server.resource["^/api/diskguard/update$"]["POST"] = doDiskGuardUpdate;
 
     // static/dynamic resources
     server.resource["^/images/sunshine.ico$"]["GET"] = getFaviconImage;
