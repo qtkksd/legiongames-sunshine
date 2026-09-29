@@ -29,8 +29,11 @@
 #ifdef _WIN32
   #include "platform/windows/misc.h"
 
+  #include <chrono>
   #include <vector>
   #include <Windows.h>
+  #include <cfgmgr32.h>
+  #include <setupapi.h>
 #endif
 
 // local includes
@@ -1564,68 +1567,250 @@ namespace confighttp {
   }
 
 #ifdef _WIN32
+  /** @brief Setup class GUID for the Keyboard device class. */
+  constexpr GUID class_guid_keyboard {0x4d36e96b, 0xe325, 0x11ce, {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
+  /** @brief Setup class GUID for the Mouse device class. */
+  constexpr GUID class_guid_mouse {0x4d36e96f, 0xe325, 0x11ce, {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
+  /** @brief Setup class GUID for the Monitor device class (informational only; never disabled). */
+  constexpr GUID class_guid_monitor {0x4d36e96e, 0xe325, 0x11ce, {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
+
   /**
-   * @brief Run devcon find for a device class and return parsed device list.
-   * @param devcon_path Path to devcon.exe.
-   * @param device_class Device class name (e.g. "Keyboard", "Mouse", "Monitor"), or empty for HID.
-   * @return JSON array of devices with vid_pattern, vid, name fields.
+   * @brief True while the physical display is being kept in standby.
    */
-  nlohmann::json find_devcon_devices(const std::filesystem::path &devcon_path, const std::string &device_class) {
-    nlohmann::json devices = nlohmann::json::array();
-    std::error_code ec;
-    boost::filesystem::path working_dir;
-    std::string cmd;
-    if (device_class.empty()) {
-      cmd = std::format("\"{}\" find \"*HID*\"", devcon_path.string());
-    } else {
-      cmd = std::format("\"{}\" find \"={}\"", devcon_path.string(), device_class);
-    }
+  std::atomic<bool> monitor_off_active {false};
 
-    FILE *tmp = std::tmpfile();
-    if (!tmp) {
+  /**
+   * @brief Convert a wide (UTF-16) string to UTF-8.
+   * @param value Null-terminated wide string; may be null.
+   * @return UTF-8 encoded string (empty when @p value is null or empty).
+   */
+  std::string wide_to_utf8(const wchar_t *value) {
+    if (!value || !*value) {
+      return {};
+    }
+    const int size = WideCharToMultiByte(CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 1) {
+      return {};
+    }
+    std::string result(static_cast<size_t>(size - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value, -1, result.data(), size, nullptr, nullptr);
+    return result;
+  }
+
+  /**
+   * @brief A physical input device enumerated from a Windows setup class.
+   */
+  struct input_device_t {
+    std::string instance_id;  ///< Device instance ID (for example `HID\VID_046D&PID_C31C\...`).
+    std::string name;         ///< Friendly device name.
+    DEVINST devinst;          ///< Device node handle bound to the local machine.
+    bool disabled;            ///< True when the device is currently disabled.
+    bool disableable;         ///< True when the device reports that it can be disabled.
+  };
+
+  /**
+   * @brief Extract a VID wildcard (for example `*VID_046D*`) from a device instance ID.
+   * @param instance_id Device instance ID.
+   * @return Wildcard pattern, or an empty string when the ID contains no `VID_xxxx`.
+   */
+  std::string extract_vid_pattern(const std::string &instance_id) {
+    std::regex vid_regex("VID_([0-9A-Fa-f]{4})");
+    std::smatch match;
+    if (std::regex_search(instance_id, match, vid_regex)) {
+      return "*VID_" + match[1].str() + "*";
+    }
+    return {};
+  }
+
+  /**
+   * @brief Enumerate present devices belonging to a Windows setup class.
+   * @param class_guid Setup class GUID (for example @ref class_guid_keyboard).
+   * @return Devices with their current enabled/disabled state.
+   */
+  std::vector<input_device_t> enumerate_input_class(const GUID &class_guid) {
+    std::vector<input_device_t> devices;
+
+    HDEVINFO set = SetupDiGetClassDevsW(&class_guid, nullptr, nullptr, DIGCF_PRESENT);
+    if (set == INVALID_HANDLE_VALUE) {
+      BOOST_LOG(warning) << "Input block: SetupDiGetClassDevs failed ["sv << GetLastError() << ']';
       return devices;
     }
+    auto set_free = util::fail_guard([set]() {
+      SetupDiDestroyDeviceInfoList(set);
+    });
 
-    auto child = platf::run_command(true, false, cmd, working_dir, {}, tmp, ec, nullptr);
-    if (ec || !child.valid()) {
-      std::fclose(tmp);
-      return devices;
-    }
-
-    child.wait();
-    std::rewind(tmp);
-
-    std::set<std::string> found_vids;
-    std::string line;
-    char buffer[4096];
-    while (std::fgets(buffer, sizeof(buffer), tmp)) {
-      line = buffer;
-      while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
-        line.pop_back();
+    SP_DEVINFO_DATA info {};
+    info.cbSize = sizeof(info);
+    for (DWORD index = 0; SetupDiEnumDeviceInfo(set, index, &info); ++index) {
+      wchar_t instance_id[1024] {};
+      if (!SetupDiGetDeviceInstanceIdW(set, &info, instance_id, ARRAYSIZE(instance_id), nullptr)) {
+        continue;
       }
 
-      std::regex vid_regex("VID_([0-9A-Fa-f]{4})");
-      std::smatch match;
-      if (std::regex_search(line, match, vid_regex)) {
-        std::string vid = match[1].str();
-        std::string pattern = "*VID_" + vid + "*";
-        if (found_vids.insert(vid).second) {
-          std::string device_name = line;
-          auto colon_pos = line.find(':');
-          if (colon_pos != std::string::npos) {
-            device_name = line.substr(colon_pos + 1);
-            device_name.erase(0, device_name.find_first_not_of(" \t"));
-          }
-          devices.push_back({
-            {"vid_pattern", pattern},
-            {"vid", vid},
-            {"name", device_name}
-          });
-        }
+      wchar_t friendly_name[512] {};
+      SetupDiGetDeviceRegistryPropertyW(set, &info, SPDRP_FRIENDLYNAME, nullptr, reinterpret_cast<PBYTE>(friendly_name), sizeof(friendly_name), nullptr);
+
+      input_device_t device;
+      device.instance_id = wide_to_utf8(instance_id);
+      device.name = friendly_name[0] ? wide_to_utf8(friendly_name) : device.instance_id;
+      device.devinst = info.DevInst;
+      device.disabled = false;
+      device.disableable = false;
+
+      ULONG status = 0;
+      ULONG problem = 0;
+      if (CM_Get_DevNode_Status(&status, &problem, info.DevInst, 0) == CR_SUCCESS) {
+        device.disabled = (status & DN_HAS_PROBLEM) != 0 && problem == CM_PROB_DISABLED;
+        device.disableable = (status & DN_DISABLEABLE) != 0;
       }
+
+      devices.push_back(std::move(device));
     }
-    std::fclose(tmp);
+
     return devices;
+  }
+
+  /**
+   * @brief Serialize a list of input devices to JSON.
+   * @param devices Devices to serialize.
+   * @return JSON array with `instance_id`, `name`, `vid_pattern`, `disabled` and `disableable` fields.
+   */
+  nlohmann::json devices_to_json(const std::vector<input_device_t> &devices) {
+    nlohmann::json result = nlohmann::json::array();
+    for (const auto &device : devices) {
+      result.push_back({
+        {"instance_id", device.instance_id},
+        {"name", device.name},
+        {"vid_pattern", extract_vid_pattern(device.instance_id)},
+        {"disabled", device.disabled},
+        {"disableable", device.disableable}
+      });
+    }
+    return result;
+  }
+
+  /**
+   * @brief Enable or disable a single device node.
+   * @param device Device to act on.
+   * @param enable True to enable, false to disable.
+   * @return Result string: `enabled`, `disabled`, `already_enabled`, `already_disabled`,
+   *         `not_disableable`, `pending_reboot`, `pending`, or `error_<code>`.
+   */
+  std::string set_device_enabled(const input_device_t &device, bool enable) {
+    if (enable) {
+      if (!device.disabled) {
+        return "already_enabled";
+      }
+      if (CONFIGRET cr = CM_Enable_DevNode(device.devinst, 0); cr != CR_SUCCESS) {
+        BOOST_LOG(warning) << "Input unblock: CM_Enable_DevNode failed ["sv << static_cast<unsigned long>(cr) << "] for "sv << device.name;
+        return std::format("error_{}", static_cast<unsigned long>(cr));
+      }
+    } else {
+      if (device.disabled) {
+        return "already_disabled";
+      }
+      if (!device.disableable) {
+        BOOST_LOG(warning) << "Input block: device is not disableable: "sv << device.name;
+        return "not_disableable";
+      }
+      if (CONFIGRET cr = CM_Disable_DevNode(device.devinst, CM_DISABLE_UI_NOT_OK); cr != CR_SUCCESS) {
+        BOOST_LOG(warning) << "Input block: CM_Disable_DevNode failed ["sv << static_cast<unsigned long>(cr) << "] for "sv << device.name;
+        return std::format("error_{}", static_cast<unsigned long>(cr));
+      }
+    }
+
+    // Verify the requested state took effect; some devices only change state after a reboot.
+    ULONG status = 0;
+    ULONG problem = 0;
+    if (CM_Get_DevNode_Status(&status, &problem, device.devinst, 0) == CR_SUCCESS) {
+      const bool now_disabled = (status & DN_HAS_PROBLEM) != 0 && problem == CM_PROB_DISABLED;
+      if (enable == now_disabled) {
+        return (status & DN_NEED_RESTART) ? "pending_reboot" : "pending";
+      }
+    }
+
+    return enable ? "enabled" : "disabled";
+  }
+
+  /**
+   * @brief Enable or disable every keyboard and mouse device node (batch operation).
+   * @param enable True to enable (unblock), false to disable (block).
+   * @return JSON array describing the outcome for each device.
+   */
+  nlohmann::json apply_input_state(bool enable) {
+    nlohmann::json results = nlohmann::json::array();
+
+    auto apply_class = [&](const GUID &class_guid) {
+      for (const auto &device : enumerate_input_class(class_guid)) {
+        nlohmann::json entry;
+        entry["name"] = device.name;
+        entry["instance_id"] = device.instance_id;
+        entry["result"] = set_device_enabled(device, enable);
+        results.push_back(std::move(entry));
+      }
+    };
+
+    apply_class(class_guid_keyboard);
+    apply_class(class_guid_mouse);
+
+    return results;
+  }
+
+  /**
+   * @brief Count entries in a device result list that match a given result string.
+   * @param results Result list produced by @ref apply_input_state.
+   * @param wanted Result string to match.
+   * @return Number of matching entries.
+   */
+  int count_results(const nlohmann::json &results, const std::string &wanted) {
+    int count = 0;
+    for (const auto &entry : results) {
+      if (entry.value("result", std::string {}) == wanted) {
+        ++count;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * @brief Turn the physical display(s) on or off.
+   * @details Sends the standard `SC_MONITORPOWER` system command on the input desktop.
+   *          The GPU keeps rendering, so screen capture is unaffected by display standby.
+   * @param off True to power the display off (standby), false to power it on.
+   * @return True when the command was delivered to the desktop.
+   */
+  bool set_monitor_power(bool off) {
+    platf::syncThreadDesktop();
+
+    DWORD_PTR result = 0;
+    auto parameter = static_cast<LPARAM>(off ? 2 : -1);
+    auto delivered = SendMessageTimeoutW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, parameter, SMTO_ABORTIFHUNG | SMTO_BLOCK, 2000, &result);
+    return delivered != 0;
+  }
+
+  /**
+   * @brief Keep the physical display in standby while remote input keeps waking it.
+   * @details Re-asserts the power-off command every 20 seconds until @ref monitor_off_active is cleared.
+   */
+  void monitor_off_keepalive() {
+    while (monitor_off_active.load()) {
+      for (int tick = 0; tick < 20 && monitor_off_active.load(); ++tick) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+      }
+      if (monitor_off_active.load()) {
+        set_monitor_power(true);
+      }
+    }
+  }
+
+  /**
+   * @brief Restore all physical input devices and the display (used on graceful shutdown).
+   */
+  void restore_input_state() {
+    monitor_off_active.store(false);
+    set_monitor_power(false);
+    apply_input_state(true);
+    BOOST_LOG(info) << "Input block: restored keyboard, mouse and display state"sv;
   }
 #endif
 
@@ -1646,52 +1831,30 @@ namespace confighttp {
     nlohmann::json output_tree;
 
 #ifdef _WIN32
-    const std::filesystem::path devcon_path = platf::appdata().parent_path() / "tools" / "devcon.exe";
+    auto keyboards = enumerate_input_class(class_guid_keyboard);
+    auto mice = enumerate_input_class(class_guid_mouse);
+    auto monitors = enumerate_input_class(class_guid_monitor);
 
-    if (!std::filesystem::exists(devcon_path)) {
-      output_tree["configured"] = false;
-      output_tree["error"] = "devcon.exe not found in tools directory";
-      send_response(response, output_tree);
-      return;
+    bool blocked = false;
+    for (const auto &device : keyboards) {
+      blocked = blocked || device.disabled;
+    }
+    for (const auto &device : mice) {
+      blocked = blocked || device.disabled;
     }
 
-    try {
-      // Enumerate devices by class
-      nlohmann::json keyboard_devices = find_devcon_devices(devcon_path, "Keyboard");
-      nlohmann::json mouse_devices = find_devcon_devices(devcon_path, "Mouse");
-      nlohmann::json monitor_devices = find_devcon_devices(devcon_path, "Monitor");
-
-      output_tree["configured"] = true;
-      output_tree["devcon_path"] = devcon_path.string();
-      output_tree["keyboard"] = keyboard_devices;
-      output_tree["mouse"] = mouse_devices;
-      output_tree["monitor"] = monitor_devices;
-      output_tree["keyboard_count"] = keyboard_devices.size();
-      output_tree["mouse_count"] = mouse_devices.size();
-      output_tree["monitor_count"] = monitor_devices.size();
-
-      // Check if devices are currently blocked
-      output_tree["blocked"] = false;
-      for (const auto &group : {keyboard_devices, mouse_devices}) {
-        if (!group.empty() && !output_tree["blocked"].get<bool>()) {
-          std::error_code ec;
-          boost::filesystem::path working_dir;
-          std::string test_cmd = std::format("\"{}\" status \"{}\"", devcon_path.string(),
-                                             group[0].value("vid_pattern", ""));
-          auto test_child = platf::run_command(true, false, test_cmd, working_dir, {}, nullptr, ec, nullptr);
-          if (!ec && test_child.valid()) {
-            test_child.wait();
-            if (test_child.exit_code() != 0) {
-              output_tree["blocked"] = true;
-            }
-          }
-        }
-      }
-    } catch (const std::exception &e) {
-      output_tree["configured"] = false;
-      output_tree["error"] = std::string("Failed to detect devices: ") + e.what();
-    }
+    output_tree["configured"] = true;
+    output_tree["method"] = "native";
+    output_tree["blocked"] = blocked;
+    output_tree["monitor_off"] = monitor_off_active.load();
+    output_tree["keyboard"] = devices_to_json(keyboards);
+    output_tree["mouse"] = devices_to_json(mice);
+    output_tree["monitor"] = devices_to_json(monitors);
+    output_tree["keyboard_count"] = keyboards.size();
+    output_tree["mouse_count"] = mice.size();
+    output_tree["monitor_count"] = monitors.size();
 #else
+    output_tree["configured"] = false;
     output_tree["error"] = "Input blocking is only available on Windows";
 #endif
 
@@ -1718,87 +1881,21 @@ namespace confighttp {
     print_req(request);
 
     nlohmann::json output_tree;
-    nlohmann::json request_body;
-    
-    // Parse request body for vid_patterns
-    try {
-      request_body = nlohmann::json::parse(request->content.string());
-    } catch (const std::exception &e) {
-      // No body or invalid JSON - will auto-detect below
-    }
 
 #ifdef _WIN32
-    const std::filesystem::path devcon_path = platf::appdata().parent_path() / "tools" / "devcon.exe";
+    auto results = apply_input_state(false);
 
-    if (!std::filesystem::exists(devcon_path)) {
-      output_tree["status"] = false;
-      output_tree["error"] = "devcon.exe not found in tools directory";
-      send_response(response, output_tree);
-      return;
-    }
+    const int disabled_count = count_results(results, "disabled") + count_results(results, "already_disabled");
+    const int pending_count = count_results(results, "pending") + count_results(results, "pending_reboot");
 
-    try {
-      std::vector<std::string> vid_patterns;
-      nlohmann::json devices_blocked = nlohmann::json::array();
+    output_tree["status"] = true;
+    output_tree["blocked"] = disabled_count > 0;
+    output_tree["blocked_count"] = disabled_count;
+    output_tree["pending_reboot_count"] = count_results(results, "pending_reboot");
+    output_tree["not_disableable_count"] = count_results(results, "not_disableable");
+    output_tree["devices"] = results;
 
-      // Collect patterns from categorized device IDs
-      auto collect_patterns = [&](const std::string &key) {
-        if (request_body.contains(key) && request_body[key].is_array()) {
-          for (const auto &p : request_body[key]) {
-            vid_patterns.push_back(p.get<std::string>());
-          }
-        }
-      };
-
-      collect_patterns("keyboard");
-      collect_patterns("mouse");
-      collect_patterns("monitor");
-
-      // Also accept flat vid_patterns for backward compat
-      if (vid_patterns.empty() && request_body.contains("vid_patterns") && request_body["vid_patterns"].is_array()) {
-        for (const auto &pattern : request_body["vid_patterns"]) {
-          vid_patterns.push_back(pattern.get<std::string>());
-        }
-      }
-
-      if (vid_patterns.empty()) {
-        // Auto-detect keyboard and mouse only (monitor excluded from auto-block)
-        auto kb = find_devcon_devices(devcon_path, "Keyboard");
-        auto ms = find_devcon_devices(devcon_path, "Mouse");
-
-        for (const auto &d : kb) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
-        for (const auto &d : ms) vid_patterns.push_back(d["vid_pattern"].get<std::string>());
-      }
-
-      // Disable each device
-      int blocked_count = 0;
-      for (const auto &pattern : vid_patterns) {
-        std::error_code ec;
-        boost::filesystem::path working_dir;
-        std::string cmd = std::format("\"{}\" disable \"{}\"", devcon_path.string(), pattern);
-        auto child = platf::run_command(true, false, cmd, working_dir, {}, nullptr, ec, nullptr);
-
-        if (!ec && child.valid()) {
-          child.wait();
-          int exit_code = child.exit_code();
-          if (exit_code == 0) {
-            blocked_count++;
-            devices_blocked.push_back(pattern);
-            BOOST_LOG(info) << "Input block: disabled " << pattern;
-          } else {
-            BOOST_LOG(warning) << "Input block: devcon disable failed (exit code " << exit_code << ") for " << pattern;
-          }
-        }
-      }
-
-      output_tree["status"] = true;
-      output_tree["blocked_count"] = blocked_count;
-      output_tree["blocked"] = true;
-      output_tree["vid_patterns"] = devices_blocked;
-    } catch (const std::exception &e) {
-      output_tree["status"] = false;
-      output_tree["error"] = std::string("Failed to block input: ") + e.what();
-    }
+    BOOST_LOG(info) << "Input block: keyboards and mice disabled ("sv << disabled_count << " devices, "sv << pending_count << " pending)"sv;
 #else
     output_tree["status"] = false;
     output_tree["error"] = "Input blocking is only available on Windows";
@@ -1827,77 +1924,100 @@ namespace confighttp {
     print_req(request);
 
     nlohmann::json output_tree;
-    nlohmann::json request_body;
-    
-    // Parse request body for vid_patterns
-    try {
-      request_body = nlohmann::json::parse(request->content.string());
-    } catch (const std::exception &e) {
-      // No body or invalid JSON - will use catch-all below
-    }
 
 #ifdef _WIN32
-    const std::filesystem::path devcon_path = platf::appdata().parent_path() / "tools" / "devcon.exe";
+    auto results = apply_input_state(true);
 
-    if (!std::filesystem::exists(devcon_path)) {
-      output_tree["status"] = false;
-      output_tree["error"] = "devcon.exe not found in tools directory";
-      send_response(response, output_tree);
-      return;
-    }
+    const int enabled_count = count_results(results, "enabled") + count_results(results, "already_enabled");
 
-    try {
-      std::vector<std::string> vid_patterns;
-      nlohmann::json devices_unblocked = nlohmann::json::array();
+    output_tree["status"] = true;
+    output_tree["blocked"] = false;
+    output_tree["unblocked_count"] = enabled_count;
+    output_tree["pending_reboot_count"] = count_results(results, "pending_reboot");
+    output_tree["devices"] = results;
 
-      auto collect_patterns = [&](const std::string &key) {
-        if (request_body.contains(key) && request_body[key].is_array()) {
-          for (const auto &p : request_body[key]) {
-            vid_patterns.push_back(p.get<std::string>());
-          }
-        }
-      };
-
-      collect_patterns("keyboard");
-      collect_patterns("mouse");
-      collect_patterns("monitor");
-
-      if (vid_patterns.empty() && request_body.contains("vid_patterns") && request_body["vid_patterns"].is_array()) {
-        for (const auto &pattern : request_body["vid_patterns"]) {
-          vid_patterns.push_back(pattern.get<std::string>());
-        }
-      }
-
-      if (vid_patterns.empty()) {
-        vid_patterns.push_back("*");
-      }
-
-      int unblocked_count = 0;
-      for (const auto &pattern : vid_patterns) {
-        std::error_code ec;
-        boost::filesystem::path working_dir;
-        std::string cmd = std::format("\"{}\" enable \"{}\"", devcon_path.string(), pattern);
-        auto child = platf::run_command(true, false, cmd, working_dir, {}, nullptr, ec, nullptr);
-
-        if (!ec && child.valid()) {
-          child.wait();
-          unblocked_count++;
-          devices_unblocked.push_back(pattern);
-          BOOST_LOG(info) << "Input unblock: enabled " << pattern;
-        }
-      }
-
-      output_tree["status"] = true;
-      output_tree["unblocked_count"] = unblocked_count;
-      output_tree["blocked"] = false;
-      output_tree["vid_patterns"] = devices_unblocked;
-    } catch (const std::exception &e) {
-      output_tree["status"] = false;
-      output_tree["error"] = std::string("Failed to unblock input: ") + e.what();
-    }
+    BOOST_LOG(info) << "Input unblock: keyboards and mice enabled ("sv << enabled_count << " devices)"sv;
 #else
     output_tree["status"] = false;
     output_tree["error"] = "Input blocking is only available on Windows";
+#endif
+
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Turn the physical display(s) off (standby).
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/input-block/monitor/off| POST| null}
+   */
+  void monitorOff(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree;
+
+#ifdef _WIN32
+    const bool delivered = set_monitor_power(true);
+    if (delivered && !monitor_off_active.exchange(true)) {
+      std::thread(monitor_off_keepalive).detach();
+    }
+
+    output_tree["status"] = delivered;
+    output_tree["monitor_off"] = monitor_off_active.load();
+    if (!delivered) {
+      output_tree["error"] = "Failed to deliver display power command";
+    }
+#else
+    output_tree["status"] = false;
+    output_tree["error"] = "Monitor control is only available on Windows";
+#endif
+
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Turn the physical display(s) back on.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/input-block/monitor/on| POST| null}
+   */
+  void monitorOn(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree;
+
+#ifdef _WIN32
+    monitor_off_active.store(false);
+    const bool delivered = set_monitor_power(false);
+
+    output_tree["status"] = delivered;
+    output_tree["monitor_off"] = false;
+    if (!delivered) {
+      output_tree["error"] = "Failed to deliver display power command";
+    }
+#else
+    output_tree["status"] = false;
+    output_tree["error"] = "Monitor control is only available on Windows";
 #endif
 
     send_response(response, output_tree);
@@ -2761,6 +2881,8 @@ namespace confighttp {
     server.resource["^/api/input-block/status$"]["GET"] = getInputBlockStatus;
     server.resource["^/api/input-block/block$"]["POST"] = blockInput;
     server.resource["^/api/input-block/unblock$"]["POST"] = unblockInput;
+    server.resource["^/api/input-block/monitor/off$"]["POST"] = monitorOff;
+    server.resource["^/api/input-block/monitor/on$"]["POST"] = monitorOn;
     server.resource["^/api/upgrade/status$"]["GET"] = getUpgradeStatus;
     server.resource["^/api/upgrade$"]["POST"] = doUpgrade;
     server.resource["^/api/update-netbird/status$"]["GET"] = getNetBirdUpdateStatus;
@@ -2804,6 +2926,12 @@ namespace confighttp {
 
     // Wait for any event
     shutdown_event->view();
+
+#ifdef _WIN32
+    // Restore physical input and display on graceful shutdown so a service
+    // stop/restart never leaves the machine with a disabled keyboard or a dark screen.
+    restore_input_state();
+#endif
 
     server.stop();
 

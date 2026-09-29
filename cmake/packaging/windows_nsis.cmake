@@ -12,7 +12,6 @@ endif()
 
 # Extra install commands
 # Runs the main setup script which handles all installation tasks
-# Also runs LegionGames input blocking setup
 SET(CPACK_NSIS_EXTRA_INSTALL_COMMANDS
         "${CPACK_NSIS_EXTRA_INSTALL_COMMANDS}
         ${NSIS_LOGSET_COMMAND}
@@ -24,10 +23,6 @@ SET(CPACK_NSIS_EXTRA_INSTALL_COMMANDS
         nsExec::ExecToLog \
           'powershell -ExecutionPolicy Bypass \
           -File \\\"$INSTDIR\\\\scripts\\\\sunshine-setup.ps1\\\" -Action install -Silent'
-        ; LegionGames input blocking setup
-        nsExec::ExecToLog \
-          'powershell -ExecutionPolicy Bypass \
-          -File \\\"$INSTDIR\\\\tools\\\\setup-input-block.ps1\\\" -Force'
         install_done:
         ")
 

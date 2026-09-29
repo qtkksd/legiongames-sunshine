@@ -98,6 +98,7 @@ list(PREPEND PLATFORM_LIBRARIES
         libwinpthread.a
         minhook::minhook
         ntdll
+        cfgmgr32
         setupapi
         shlwapi
         synchronization.lib
