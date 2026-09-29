@@ -2625,6 +2625,9 @@ namespace confighttp {
   /**
    * @brief Revert the protected volume to the gold snapshot.
    * @api_examples{/api/diskguard/revert| POST| null}
+   *
+   * Optional JSON body {"index": N} selects the snapshot by age
+   * (0 = newest, default; 1 = previous).
    */
   void doDiskGuardRevert(const resp_https_t &response, const req_https_t &request) {
     if (!authenticate(response, request)) {
@@ -2638,10 +2641,18 @@ namespace confighttp {
 
     print_req(request);
 
+    std::string args = "revert";
+    try {
+      auto body = nlohmann::json::parse(request->content.string());
+      if (body.contains("index")) {
+        args = std::format("revert --index {}", body["index"].get<int>());
+      }
+    } catch (...) {}
+
     nlohmann::json output_tree;
 #ifdef _WIN32
     std::string error;
-    if (!run_diskguard("revert", output_tree, error)) {
+    if (!run_diskguard(args, output_tree, error)) {
       output_tree = {{"status", false}, {"error", error}};
     }
 #else
