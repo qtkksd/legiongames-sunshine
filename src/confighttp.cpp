@@ -2675,8 +2675,21 @@ namespace confighttp {
     try {
       out = nlohmann::json::parse(content);
     } catch (...) {
-      out = nlohmann::json::object();
-      out["raw"] = content;
+      // lgd may mix stderr log lines with its JSON stdout; retry on the
+      // trailing JSON object (the last line that begins with '{').
+      std::string trimmed = content;
+      const auto pos = content.rfind("\n{");
+      if (pos != std::string::npos) {
+        trimmed = content.substr(pos + 1);
+      } else if (const auto b = content.find('{'); b != std::string::npos) {
+        trimmed = content.substr(b);
+      }
+      try {
+        out = nlohmann::json::parse(trimmed);
+      } catch (...) {
+        out = nlohmann::json::object();
+        out["raw"] = content;
+      }
     }
 
     if (exit_code != 0) {
