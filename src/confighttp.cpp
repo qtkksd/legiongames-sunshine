@@ -2719,7 +2719,11 @@ namespace confighttp {
 #ifdef _WIN32
     std::string error;
     if (!run_diskguard("status", output_tree, error)) {
-      output_tree = {{"status", false}, {"error", error}};
+      if (!output_tree.is_object() || output_tree.empty()) {
+        output_tree = nlohmann::json::object();
+      }
+      output_tree["status"] = false;
+      output_tree["error"] = error;
     }
 #else
     output_tree = {{"status", false}, {"error", "DiskGuard is only available on Windows"}};
@@ -2747,7 +2751,11 @@ namespace confighttp {
 #ifdef _WIN32
     std::string error;
     if (!run_diskguard("snapshot", output_tree, error)) {
-      output_tree = {{"status", false}, {"error", error}};
+      if (!output_tree.is_object() || output_tree.empty()) {
+        output_tree = nlohmann::json::object();
+      }
+      output_tree["status"] = false;
+      output_tree["error"] = error;
     }
 #else
     output_tree = {{"status", false}, {"error", "DiskGuard is only available on Windows"}};
@@ -2759,8 +2767,9 @@ namespace confighttp {
    * @brief Revert the protected volume to the gold snapshot.
    * @api_examples{/api/diskguard/revert| POST| null}
    *
-   * Optional JSON body {"index": N} selects the snapshot by age
-   * (0 = newest, default; 1 = previous).
+   * Optional JSON body {"index": N, "dry_run": bool}:
+   *   index   - snapshot by age (0 = newest, default; 1 = previous)
+   *   dry_run - plan only, make no changes
    */
   void doDiskGuardRevert(const resp_https_t &response, const req_https_t &request) {
     if (!authenticate(response, request)) {
@@ -2778,7 +2787,10 @@ namespace confighttp {
     try {
       auto body = nlohmann::json::parse(request->content.string());
       if (body.contains("index")) {
-        args = std::format("revert --index {}", body["index"].get<int>());
+        args += std::format(" --index {}", body["index"].get<int>());
+      }
+      if (body.value("dry_run", false)) {
+        args += " --dry-run";
       }
     } catch (...) {}
 
@@ -2786,7 +2798,11 @@ namespace confighttp {
 #ifdef _WIN32
     std::string error;
     if (!run_diskguard(args, output_tree, error)) {
-      output_tree = {{"status", false}, {"error", error}};
+      if (!output_tree.is_object() || output_tree.empty()) {
+        output_tree = nlohmann::json::object();
+      }
+      output_tree["status"] = false;
+      output_tree["error"] = error;
     }
 #else
     output_tree = {{"status", false}, {"error", "DiskGuard is only available on Windows"}};
@@ -2814,7 +2830,11 @@ namespace confighttp {
 #ifdef _WIN32
     std::string error;
     if (!run_diskguard("update", output_tree, error)) {
-      output_tree = {{"status", false}, {"error", error}};
+      if (!output_tree.is_object() || output_tree.empty()) {
+        output_tree = nlohmann::json::object();
+      }
+      output_tree["status"] = false;
+      output_tree["error"] = error;
     }
 #else
     output_tree = {{"status", false}, {"error", "DiskGuard is only available on Windows"}};
