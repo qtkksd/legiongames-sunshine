@@ -262,6 +262,12 @@ namespace input {
 
     int32_t accumulated_vscroll_delta;  ///< Accumulated vscroll delta.
     int32_t accumulated_hscroll_delta;  ///< Accumulated hscroll delta.
+
+    // State for relative_mouse mode: last absolute position we injected, used
+    // to compute relative deltas for raw-input fullscreen games.
+    float rel_last_x = 0.0f;  ///< Last injected absolute x (touch port coords).
+    float rel_last_y = 0.0f;  ///< Last injected absolute y (touch port coords).
+    bool rel_last_valid = false;  ///< Whether rel_last_x/y are valid.
   };
 
   /**
@@ -708,6 +714,37 @@ namespace input {
       touch_port_dim_x,
       touch_port_dim_y
     };
+
+    // relative_mouse: some games (raw-input exclusive fullscreen) ignore
+    // absolute cursor motion and only consume relative deltas. Convert the
+    // absolute point into a relative delta vs the last injected position.
+    //
+    // tpcoords are in touch-port space; scale to the capture environment's
+    // physical pixels so the relative motion matches an absolute move.
+    if (config::input.relative_mouse) {
+      const float sw = (float) (touch_port.env_width ? touch_port.env_width : (abs_port.width ? abs_port.width : 1));
+      const float sh = (float) (touch_port.env_height ? touch_port.env_height : (abs_port.height ? abs_port.height : 1));
+      const float sx = sw / (float) (abs_port.width ? abs_port.width : 1);
+      const float sy = sh / (float) (abs_port.height ? abs_port.height : 1);
+
+      const float cx = tpcoords->first;
+      const float cy = tpcoords->second;
+
+      int dx = 0;
+      int dy = 0;
+      if (input->rel_last_valid) {
+        dx = (int) std::lround((cx - input->rel_last_x) * sx);
+        dy = (int) std::lround((cy - input->rel_last_y) * sy);
+      }
+      input->rel_last_x = cx;
+      input->rel_last_y = cy;
+      input->rel_last_valid = true;
+
+      if (dx != 0 || dy != 0) {
+        platf::move_mouse(platf_input, dx, dy);
+      }
+      return;
+    }
 
     platf::abs_mouse(platf_input, abs_port, tpcoords->first, tpcoords->second);
   }

@@ -283,6 +283,7 @@ namespace config {
     bool keyboard;  ///< Enable keyboard input from clients.
     bool key_rightalt_to_key_win;  ///< Map the client Right Alt key to the Windows key.
     bool mouse;  ///< Enable mouse input from clients.
+    bool relative_mouse;  ///< Inject mouse as relative deltas (for raw-input fullscreen games).
     bool controller;  ///< Enable controller input from clients.
 
     bool always_send_scancodes;  ///< Always send keyboard scancodes when available.
