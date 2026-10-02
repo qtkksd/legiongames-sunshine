@@ -284,6 +284,7 @@ namespace config {
     bool key_rightalt_to_key_win;  ///< Map the client Right Alt key to the Windows key.
     bool mouse;  ///< Enable mouse input from clients.
     bool relative_mouse;  ///< Inject mouse as relative deltas (for raw-input fullscreen games).
+    bool fakerinput;  ///< Route mouse input through the FakerInput virtual HID driver (POC).
     bool controller;  ///< Enable controller input from clients.
 
     bool always_send_scancodes;  ///< Always send keyboard scancodes when available.

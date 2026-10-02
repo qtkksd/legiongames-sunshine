@@ -25,6 +25,9 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "platform/common.h"
+#ifdef _WIN32
+  #include "platform/windows/fakerinput.h"
+#endif
 #include "thread_pool.h"
 #include "utility.h"
 
@@ -571,7 +574,18 @@ namespace input {
     }
 
     input->mouse_left_button_timeout = DISABLE_LEFT_BUTTON_DELAY;
-    platf::move_mouse(platf_input, util::endian::big(packet->deltaX), util::endian::big(packet->deltaY));
+
+    auto deltaX = util::endian::big(packet->deltaX);
+    auto deltaY = util::endian::big(packet->deltaY);
+
+#ifdef _WIN32
+    if (config::input.fakerinput && fakerinput::connected()) {
+      fakerinput::move(deltaX, deltaY);
+      return;
+    }
+#endif
+
+    platf::move_mouse(platf_input, deltaX, deltaY);
   }
 
   /**
@@ -721,7 +735,7 @@ namespace input {
     //
     // tpcoords are in touch-port space; scale to the capture environment's
     // physical pixels so the relative motion matches an absolute move.
-    if (config::input.relative_mouse) {
+    if (config::input.relative_mouse || config::input.fakerinput) {
       const float sw = (float) (touch_port.env_width ? touch_port.env_width : (abs_port.width ? abs_port.width : 1));
       const float sh = (float) (touch_port.env_height ? touch_port.env_height : (abs_port.height ? abs_port.height : 1));
       const float sx = sw / (float) (abs_port.width ? abs_port.width : 1);
@@ -741,7 +755,15 @@ namespace input {
       input->rel_last_valid = true;
 
       if (dx != 0 || dy != 0) {
+#ifdef _WIN32
+        if (config::input.fakerinput && fakerinput::connected()) {
+          fakerinput::move(dx, dy);
+        } else {
+          platf::move_mouse(platf_input, dx, dy);
+        }
+#else
         platf::move_mouse(platf_input, dx, dy);
+#endif
       }
       return;
     }
@@ -762,6 +784,14 @@ namespace input {
 
     auto release = util::endian::little(packet->header.magic) == MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5;
     auto button = util::endian::big(packet->button);
+
+#ifdef _WIN32
+    if (config::input.fakerinput && fakerinput::connected()) {
+      fakerinput::button(button, release);
+      return;
+    }
+#endif
+
     if (button > 0 && button < mouse_press.size()) {
       if (mouse_press[button] != release) {
         // button state is already what we want
@@ -1034,6 +1064,16 @@ namespace input {
       return;
     }
 
+#ifdef _WIN32
+    if (config::input.fakerinput && fakerinput::connected()) {
+      auto ticks = util::endian::big(packet->scrollAmt1) / WHEEL_DELTA;
+      if (ticks != 0) {
+        fakerinput::scroll(ticks, 0);
+      }
+      return;
+    }
+#endif
+
     if (config::input.high_resolution_scrolling) {
       platf::scroll(platf_input, util::endian::big(packet->scrollAmt1));
     } else {
@@ -1056,6 +1096,16 @@ namespace input {
     if (!config::input.mouse) {
       return;
     }
+
+#ifdef _WIN32
+    if (config::input.fakerinput && fakerinput::connected()) {
+      auto ticks = util::endian::big(packet->scrollAmount) / WHEEL_DELTA;
+      if (ticks != 0) {
+        fakerinput::scroll(0, ticks);
+      }
+      return;
+    }
+#endif
 
     if (config::input.high_resolution_scrolling) {
       platf::hscroll(platf_input, util::endian::big(packet->scrollAmount));
@@ -1900,6 +1950,9 @@ namespace input {
      * @brief Destroy the input subsystem deinitializer.
      */
     ~deinit_t() override {
+#ifdef _WIN32
+      fakerinput::shutdown();
+#endif
       platf_input.reset();
     }
   };
@@ -1909,6 +1962,12 @@ namespace input {
    */
   [[nodiscard]] std::unique_ptr<platf::deinit_t> init() {
     platf_input = platf::input();
+
+#ifdef _WIN32
+    if (config::input.fakerinput) {
+      fakerinput::init();
+    }
+#endif
 
     return std::make_unique<deinit_t>();
   }
