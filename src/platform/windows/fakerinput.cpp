@@ -15,7 +15,7 @@
 #include <mutex>
 
 // local includes
-#include "logging.h"
+#include "src/logging.h"
 
 namespace fakerinput {
   namespace {
