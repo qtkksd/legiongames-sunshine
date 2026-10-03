@@ -853,6 +853,7 @@ namespace config {
     true,  // ds5_inputtino_randomize_mac
 
     true,  // keyboard enabled
+    false, // key_rightalt_to_key_win disabled by default
     true,  // mouse enabled
     false, // relative_mouse disabled by default
     false, // fakerinput disabled by default
