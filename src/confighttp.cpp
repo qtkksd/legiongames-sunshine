@@ -1695,73 +1695,37 @@ namespace confighttp {
   }
 
   /**
-   * @brief Whether a device node is under the HID or USB enumerator.
+   * @brief Build the physical HID/USB ancestor chain for a HID collection.
+   * @details Returns the chain from the collection up to the topmost `USB\VID_…`
+   *          node (composite), or an empty vector if the device has no USB
+   *          ancestor (virtual/root-enumerated, e.g. FakerInput). This is the
+   *          physical-only gate: virtual devices are never targeted.
    */
-  bool is_hid_or_usb_node(DEVINST devinst) {
-    const std::string id = device_instance_id(devinst);
-    return id.rfind("HID\\", 0) == 0 || id.rfind("USB\\", 0) == 0;
-  }
+  std::vector<DEVINST> build_physical_chain(DEVINST devinst) {
+    std::vector<DEVINST> chain;
+    bool physical = false;
 
-  /**
-   * @brief Resolve the topmost disableable node in the HID/USB chain of a HID collection.
-   * @details Windows refuses to disable the active HID keyboard collection, so we
-   *          walk collection → HID device → USB interface → USB composite and pick
-   *          the highest node that reports `DN_DISABLEABLE`. Returns 0 if none is
-   *          disableable (for example a virtual/root-enumerated device).
-   */
-  DEVINST resolve_disable_target(DEVINST devinst) {
     DEVINST current = devinst;
-    DEVINST best = 0;
-
     for (int depth = 0; depth < 16; ++depth) {
-      ULONG status = 0;
-      ULONG problem = 0;
-      if (CM_Get_DevNode_Status(&status, &problem, current, 0) == CR_SUCCESS && (status & DN_DISABLEABLE)) {
-        best = current;
-      }
+      chain.push_back(current);
 
-      DEVINST parent = 0;
-      if (CM_Get_Parent(&parent, current, 0) != CR_SUCCESS || parent == 0) {
-        break;
-      }
-      const std::string id = device_instance_id(parent);
-      if (!is_hid_or_usb_node(parent)) {
-        break;  // left the HID/USB bus (PS/2, Bluetooth, virtual root, …)
-      }
-      if (id.rfind("USB\\", 0) == 0 && is_usb_hub(parent)) {
-        break;  // don't walk past a hub/root hub
-      }
-      current = parent;
-    }
-
-    return best;
-  }
-
-  /**
-   * @brief Resolve the topmost `USB\VID_…` node (fallback target) for a HID collection.
-   */
-  DEVINST resolve_top_usb(DEVINST devinst) {
-    DEVINST current = devinst;
-    DEVINST best = 0;
-
-    for (int depth = 0; depth < 16; ++depth) {
       DEVINST parent = 0;
       if (CM_Get_Parent(&parent, current, 0) != CR_SUCCESS || parent == 0) {
         break;
       }
       const std::string id = device_instance_id(parent);
       if (id.rfind("USB\\", 0) == 0) {
+        physical = true;
         if (is_usb_hub(parent)) {
-          break;
+          break;  // don't walk past a hub/root hub
         }
-        if (id.rfind("USB\\VID_", 0) == 0) {
-          best = parent;
-        }
+      } else if (id.rfind("HID\\", 0) != 0) {
+        break;  // left the HID/USB bus (PS/2, Bluetooth, virtual root, …)
       }
       current = parent;
     }
 
-    return best;
+    return physical ? chain : std::vector<DEVINST> {};
   }
 
   /**
@@ -1920,21 +1884,140 @@ namespace confighttp {
   }
 
   /**
-   * @brief Disable a device node, retrying with stronger flags if needed.
+   * @brief Set a device node's state via the class installer (Device Manager path).
+   * @details Device Manager uses DIF_PROPERTYCHANGE / DICS_* rather than
+   *          CM_Disable_DevNode, and can disable nodes that report
+   *          CR_NOT_DISABLEABLE through the CM API.
+   */
+  bool setupdi_set_state(DEVINST devinst, DWORD state_change) {
+    const std::string instance_id = device_instance_id(devinst);
+    if (instance_id.empty()) {
+      return false;
+    }
+    const std::wstring wide_id(instance_id.begin(), instance_id.end());
+
+    HDEVINFO set = SetupDiCreateDeviceInfoList(nullptr, nullptr);
+    if (set == INVALID_HANDLE_VALUE) {
+      return false;
+    }
+    auto set_free = util::fail_guard([set]() {
+      SetupDiDestroyDeviceInfoList(set);
+    });
+
+    SP_DEVINFO_DATA info {};
+    info.cbSize = sizeof(info);
+    if (!SetupDiOpenDeviceInfoW(set, wide_id.c_str(), nullptr, 0, &info)) {
+      return false;
+    }
+
+    SP_PROPCHANGE_PARAMS params {};
+    params.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+    params.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+    params.StateChange = state_change;
+    params.Scope = DICS_FLAG_GLOBAL;
+    params.HwProfile = 0;
+
+    if (!SetupDiSetClassInstallParamsW(set, &info, &params.ClassInstallHeader, sizeof(params))) {
+      return false;
+    }
+    return SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, set, &info) != FALSE;
+  }
+
+  /**
+   * @brief Force-disable a node by setting CONFIGFLAG_DISABLED and re-enumerating.
+   * @details Last resort for nodes that refuse CM_Disable_DevNode (CR_NOT_DISABLEABLE).
+   */
+  bool registry_disable(DEVINST devinst) {
+    HKEY key = nullptr;
+    if (CM_Open_DevNode_Key(devinst, KEY_QUERY_VALUE | KEY_SET_VALUE, 0, RegDisposition_OpenExisting, &key, CM_REGISTRY_HARDWARE) != CR_SUCCESS) {
+      return false;
+    }
+
+    DWORD flags = 0;
+    DWORD size = sizeof(flags);
+    DWORD type = 0;
+    RegQueryValueExW(key, L"ConfigFlags", nullptr, &type, reinterpret_cast<LPBYTE>(&flags), &size);
+    flags |= 0x00000001;  // CONFIGFLAG_DISABLED
+
+    const bool ok = RegSetValueExW(key, L"ConfigFlags", 0, REG_DWORD, reinterpret_cast<const BYTE *>(&flags), sizeof(flags)) == ERROR_SUCCESS;
+    RegCloseKey(key);
+
+    if (ok) {
+      CM_Reenumerate_DevNode(devinst, 0);
+    }
+    return ok;
+  }
+
+  /**
+   * @brief Whether a device node is currently disabled.
+   */
+  bool node_is_disabled(DEVINST devinst) {
+    ULONG status = 0;
+    ULONG problem = 0;
+    return CM_Get_DevNode_Status(&status, &problem, devinst, 0) == CR_SUCCESS &&
+           (status & DN_HAS_PROBLEM) != 0 && problem == CM_PROB_DISABLED;
+  }
+
+  /**
+   * @brief Disable a device node: CM API, then Device Manager path, then a forced
+   *        registry disable. Returns a result string.
    */
   std::string disable_node(DEVINST devinst, const std::string &name) {
     CONFIGRET cr = CM_Disable_DevNode(devinst, CM_DISABLE_UI_NOT_OK);
     if (cr == CR_NOT_DISABLEABLE) {
       cr = CM_Disable_DevNode(devinst, CM_DISABLE_ABSOLUTE | CM_DISABLE_UI_NOT_OK);
     }
-    if (cr == CR_NOT_DISABLEABLE) {
-      cr = CM_Disable_DevNode(devinst, CM_DISABLE_HARDWARE | CM_DISABLE_UI_NOT_OK);
-    }
-    if (cr == CR_SUCCESS) {
+    if (cr == CR_SUCCESS || node_is_disabled(devinst)) {
       return "disabled";
     }
-    BOOST_LOG(warning) << "Input block: CM_Disable_DevNode failed ["sv << static_cast<unsigned long>(cr) << "] for "sv << name;
+
+    if (setupdi_set_state(devinst, DICS_DISABLE) && node_is_disabled(devinst)) {
+      return "disabled";
+    }
+
+    if (registry_disable(devinst) && node_is_disabled(devinst)) {
+      return "disabled";
+    }
+
+    BOOST_LOG(warning) << "Input block: could not disable ["sv << static_cast<unsigned long>(cr) << "] "sv << name;
     return std::format("error_{}", static_cast<unsigned long>(cr));
+  }
+
+  /**
+   * @brief Outcome of trying to block one physical device.
+   */
+  struct block_outcome_t {
+    std::string group_key;   ///< Topmost physical node (for dedup); empty when virtual.
+    std::string target_id;   ///< Node actually targeted.
+    std::string result;      ///< `disabled`, `would_disable`, `already_disabled`, `not_disableable`, or `skipped_virtual`.
+  };
+
+  /**
+   * @brief Disable the physical device owning a HID collection.
+   * @details Tries each node in the collection's physical HID/USB chain, from the
+   *          topmost (USB composite) down to the collection, until one can be
+   *          disabled. Virtual devices (no USB ancestor) are never touched.
+   */
+  block_outcome_t block_physical_device(DEVINST collection, bool dry_run) {
+    const auto chain = build_physical_chain(collection);
+    if (chain.empty()) {
+      return {"", "", "skipped_virtual"};
+    }
+
+    const std::string group_key = device_instance_id(chain.back());
+
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+      const std::string id = device_instance_id(*it);
+      if (dry_run) {
+        return {group_key, id, node_is_disabled(*it) ? "already_disabled" : "would_disable"};
+      }
+      const std::string result = disable_node(*it, id);
+      if (result == "disabled") {
+        return {group_key, id, result};
+      }
+    }
+
+    return {group_key, device_instance_id(chain.back()), "not_disableable"};
   }
 
   /**
@@ -1958,21 +2041,16 @@ namespace confighttp {
         entry["instance_id"] = device.instance_id;
 
         if (!enable) {
-          // Physical-only: virtual/root-enumerated devices have no HID/USB ancestor.
-          DEVINST target = resolve_disable_target(device.devinst);
-          if (target == 0) {
-            target = resolve_top_usb(device.devinst);  // fallback: try the USB parent anyway
-          }
-          if (target == 0) {
+          const auto outcome = block_physical_device(device.devinst, dry_run);
+          if (outcome.result == "skipped_virtual") {
             entry["result"] = "skipped_virtual";
             results.push_back(std::move(entry));
             continue;
           }
 
-          const std::string target_id = device_instance_id(target);
-          entry["target"] = target_id;
+          entry["target"] = outcome.target_id;
 
-          auto known = target_result.find(target_id);
+          auto known = target_result.find(outcome.group_key);
           if (known != target_result.end()) {
             entry["result"] = "duplicate";
             entry["first_result"] = known->second;
@@ -1980,18 +2058,8 @@ namespace confighttp {
             continue;
           }
 
-          std::string result;
-          if (dry_run) {
-            ULONG status = 0;
-            ULONG problem = 0;
-            const bool already_disabled = CM_Get_DevNode_Status(&status, &problem, target, 0) == CR_SUCCESS &&
-                                          (status & DN_HAS_PROBLEM) != 0 && problem == CM_PROB_DISABLED;
-            result = already_disabled ? "already_disabled" : "would_disable";
-          } else {
-            result = disable_node(target, target_id);
-          }
-          target_result.emplace(target_id, result);
-          entry["result"] = result;
+          target_result.emplace(outcome.group_key, outcome.result);
+          entry["result"] = outcome.result;
         } else if (dry_run) {
           entry["result"] = device.disabled ? "would_enable" : "already_enabled";
         } else {
