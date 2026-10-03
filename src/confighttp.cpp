@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <map>
 #include <regex>
 #include <set>
 #include <string_view>
@@ -1624,6 +1625,8 @@ namespace confighttp {
 
   /** Setup class GUID for the USB device class (used to find disabled bus parents). */
   constexpr GUID class_guid_usb {0x36fc9e60, 0xc465, 0x11cf, {0x80, 0x56, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};
+  /** Setup class GUID for the HID device class (used to find disabled HID nodes). */
+  constexpr GUID class_guid_hid {0x745a17a0, 0x74d3, 0x11d0, {0xb6, 0xfe, 0x00, 0xa0, 0xc9, 0x0f, 0x57, 0xda}};
 
   // Device registry property ids for CM_Get_DevNode_Registry_Property.
   constexpr ULONG drp_compatible_ids = 0x00000003;
@@ -1692,30 +1695,41 @@ namespace confighttp {
   }
 
   /**
-   * @brief Resolve the owning physical USB device node for a HID collection.
-   * @details Walks up the device tree while under the USB enumerator and not a
-   *          hub, returning the topmost `USB\VID_…` node (the physical device).
-   *          Returns 0 for virtual/root-enumerated devices (for example FakerInput).
+   * @brief Whether a device node is under the HID or USB enumerator.
    */
-  DEVINST resolve_bus_target(DEVINST devinst) {
+  bool is_hid_or_usb_node(DEVINST devinst) {
+    const std::string id = device_instance_id(devinst);
+    return id.rfind("HID\\", 0) == 0 || id.rfind("USB\\", 0) == 0;
+  }
+
+  /**
+   * @brief Resolve the topmost disableable node in the HID/USB chain of a HID collection.
+   * @details Windows refuses to disable the active HID keyboard collection, so we
+   *          walk collection → HID device → USB interface → USB composite and pick
+   *          the highest node that reports `DN_DISABLEABLE`. Returns 0 if none is
+   *          disableable (for example a virtual/root-enumerated device).
+   */
+  DEVINST resolve_disable_target(DEVINST devinst) {
     DEVINST current = devinst;
     DEVINST best = 0;
 
     for (int depth = 0; depth < 16; ++depth) {
+      ULONG status = 0;
+      ULONG problem = 0;
+      if (CM_Get_DevNode_Status(&status, &problem, current, 0) == CR_SUCCESS && (status & DN_DISABLEABLE)) {
+        best = current;
+      }
+
       DEVINST parent = 0;
       if (CM_Get_Parent(&parent, current, 0) != CR_SUCCESS || parent == 0) {
         break;
       }
-
       const std::string id = device_instance_id(parent);
-      if (id.rfind("USB\\", 0) != 0) {
-        break;  // left the USB bus (PS/2, Bluetooth, virtual root, …)
+      if (!is_hid_or_usb_node(parent)) {
+        break;  // left the HID/USB bus (PS/2, Bluetooth, virtual root, …)
       }
-      if (is_usb_hub(parent)) {
+      if (id.rfind("USB\\", 0) == 0 && is_usb_hub(parent)) {
         break;  // don't walk past a hub/root hub
-      }
-      if (id.rfind("USB\\VID_", 0) == 0) {
-        best = parent;
       }
       current = parent;
     }
@@ -1724,56 +1738,91 @@ namespace confighttp {
   }
 
   /**
-   * @brief Enumerate present, disabled USB HID-related nodes (bus parents).
-   * @details Used by unblock/self-heal because a disabled bus parent hides its
-   *          child HID collections from the Keyboard/Mouse class enumeration.
+   * @brief Resolve the topmost `USB\VID_…` node (fallback target) for a HID collection.
    */
-  std::vector<input_device_t> enumerate_disabled_usb_hid_nodes() {
+  DEVINST resolve_top_usb(DEVINST devinst) {
+    DEVINST current = devinst;
+    DEVINST best = 0;
+
+    for (int depth = 0; depth < 16; ++depth) {
+      DEVINST parent = 0;
+      if (CM_Get_Parent(&parent, current, 0) != CR_SUCCESS || parent == 0) {
+        break;
+      }
+      const std::string id = device_instance_id(parent);
+      if (id.rfind("USB\\", 0) == 0) {
+        if (is_usb_hub(parent)) {
+          break;
+        }
+        if (id.rfind("USB\\VID_", 0) == 0) {
+          best = parent;
+        }
+      }
+      current = parent;
+    }
+
+    return best;
+  }
+
+  /**
+   * @brief Enumerate present, disabled HID/USB input nodes (bus parents/HID devices).
+   * @details Used by unblock/self-heal because a disabled parent hides its child
+   *          collections from the Keyboard/Mouse class enumeration.
+   */
+  std::vector<input_device_t> enumerate_disabled_hid_bus_nodes() {
     std::vector<input_device_t> devices;
 
-    HDEVINFO set = SetupDiGetClassDevsW(&class_guid_usb, nullptr, nullptr, DIGCF_PRESENT);
-    if (set == INVALID_HANDLE_VALUE) {
-      return devices;
-    }
-    auto set_free = util::fail_guard([set]() {
-      SetupDiDestroyDeviceInfoList(set);
-    });
-
-    SP_DEVINFO_DATA info {};
-    info.cbSize = sizeof(info);
-    for (DWORD index = 0; SetupDiEnumDeviceInfo(set, index, &info); ++index) {
-      wchar_t instance_id[1024] {};
-      if (!SetupDiGetDeviceInstanceIdW(set, &info, instance_id, ARRAYSIZE(instance_id), nullptr)) {
-        continue;
+    auto scan = [&](const GUID &class_guid, bool usb_only) {
+      HDEVINFO set = SetupDiGetClassDevsW(&class_guid, nullptr, nullptr, DIGCF_PRESENT);
+      if (set == INVALID_HANDLE_VALUE) {
+        return;
       }
+      auto set_free = util::fail_guard([set]() {
+        SetupDiDestroyDeviceInfoList(set);
+      });
 
-      const std::string id = wide_to_utf8(instance_id);
-      if (id.rfind("USB\\VID_", 0) != 0 || is_usb_hub(info.DevInst)) {
-        continue;
+      SP_DEVINFO_DATA info {};
+      info.cbSize = sizeof(info);
+      for (DWORD index = 0; SetupDiEnumDeviceInfo(set, index, &info); ++index) {
+        wchar_t instance_id[1024] {};
+        if (!SetupDiGetDeviceInstanceIdW(set, &info, instance_id, ARRAYSIZE(instance_id), nullptr)) {
+          continue;
+        }
+
+        const std::string id = wide_to_utf8(instance_id);
+        if (usb_only && id.rfind("USB\\", 0) != 0) {
+          continue;
+        }
+        if (is_usb_hub(info.DevInst)) {
+          continue;
+        }
+
+        const std::string service = device_string_property(info.DevInst, drp_service);
+        if (service != "usbccgp" && service != "hidusb" && service != "usbhid") {
+          continue;
+        }
+
+        input_device_t device;
+        device.instance_id = id;
+        wchar_t friendly_name[512] {};
+        SetupDiGetDeviceRegistryPropertyW(set, &info, SPDRP_FRIENDLYNAME, nullptr, reinterpret_cast<PBYTE>(friendly_name), sizeof(friendly_name), nullptr);
+        device.name = friendly_name[0] ? wide_to_utf8(friendly_name) : id;
+        device.devinst = info.DevInst;
+        device.disabled = false;
+        device.disableable = false;
+
+        ULONG status = 0;
+        ULONG problem = 0;
+        if (CM_Get_DevNode_Status(&status, &problem, info.DevInst, 0) == CR_SUCCESS) {
+          device.disabled = (status & DN_HAS_PROBLEM) != 0 && problem == CM_PROB_DISABLED;
+        }
+
+        devices.push_back(std::move(device));
       }
+    };
 
-      const std::string service = device_string_property(info.DevInst, drp_service);
-      if (service != "usbccgp" && service != "hidusb" && service != "usbhid") {
-        continue;
-      }
-
-      input_device_t device;
-      device.instance_id = id;
-      wchar_t friendly_name[512] {};
-      SetupDiGetDeviceRegistryPropertyW(set, &info, SPDRP_FRIENDLYNAME, nullptr, reinterpret_cast<PBYTE>(friendly_name), sizeof(friendly_name), nullptr);
-      device.name = friendly_name[0] ? wide_to_utf8(friendly_name) : id;
-      device.devinst = info.DevInst;
-      device.disabled = false;
-      device.disableable = false;
-
-      ULONG status = 0;
-      ULONG problem = 0;
-      if (CM_Get_DevNode_Status(&status, &problem, info.DevInst, 0) == CR_SUCCESS) {
-        device.disabled = (status & DN_HAS_PROBLEM) != 0 && problem == CM_PROB_DISABLED;
-      }
-
-      devices.push_back(std::move(device));
-    }
+    scan(class_guid_usb, true);
+    scan(class_guid_hid, false);
 
     return devices;
   }
@@ -1860,17 +1909,47 @@ namespace confighttp {
   }
 
   /**
+   * @brief Read the optional `dry_run` flag from a request body (default false).
+   */
+  bool request_dry_run(const req_https_t &request) {
+    try {
+      return nlohmann::json::parse(request->content.string()).value("dry_run", false);
+    } catch (...) {
+      return false;
+    }
+  }
+
+  /**
+   * @brief Disable a device node, retrying with stronger flags if needed.
+   */
+  std::string disable_node(DEVINST devinst, const std::string &name) {
+    CONFIGRET cr = CM_Disable_DevNode(devinst, CM_DISABLE_UI_NOT_OK);
+    if (cr == CR_NOT_DISABLEABLE) {
+      cr = CM_Disable_DevNode(devinst, CM_DISABLE_ABSOLUTE | CM_DISABLE_UI_NOT_OK);
+    }
+    if (cr == CR_NOT_DISABLEABLE) {
+      cr = CM_Disable_DevNode(devinst, CM_DISABLE_HARDWARE | CM_DISABLE_UI_NOT_OK);
+    }
+    if (cr == CR_SUCCESS) {
+      return "disabled";
+    }
+    BOOST_LOG(warning) << "Input block: CM_Disable_DevNode failed ["sv << static_cast<unsigned long>(cr) << "] for "sv << name;
+    return std::format("error_{}", static_cast<unsigned long>(cr));
+  }
+
+  /**
    * @brief Enable or disable physical keyboard and mouse input.
-   * @details Only devices with a physical USB ancestor are touched, so virtual
+   * @details Only devices with a physical HID/USB ancestor are touched, so virtual
    *          HID devices (FakerInput, Sunshine's own input) are never disabled.
-   *          Blocking disables the owning USB bus node because the HID keyboard
-   *          collection itself is not disableable.
+   *          The active HID keyboard collection is not disableable, so we disable
+   *          the highest disableable node in its HID/USB chain.
    * @param enable True to enable (unblock/self-heal), false to disable (block).
+   * @param dry_run True to plan only (report what would change, make no changes).
    * @return JSON array describing the outcome for each device.
    */
-  nlohmann::json apply_input_state(bool enable) {
+  nlohmann::json apply_input_state(bool enable, bool dry_run) {
     nlohmann::json results = nlohmann::json::array();
-    std::set<std::string> handled_targets;
+    std::map<std::string, std::string> target_result;
 
     auto apply_class = [&](const GUID &class_guid) {
       for (const auto &device : enumerate_input_class(class_guid)) {
@@ -1879,8 +1958,11 @@ namespace confighttp {
         entry["instance_id"] = device.instance_id;
 
         if (!enable) {
-          // Physical-only: virtual/root-enumerated devices have no USB ancestor.
-          const DEVINST target = resolve_bus_target(device.devinst);
+          // Physical-only: virtual/root-enumerated devices have no HID/USB ancestor.
+          DEVINST target = resolve_disable_target(device.devinst);
+          if (target == 0) {
+            target = resolve_top_usb(device.devinst);  // fallback: try the USB parent anyway
+          }
           if (target == 0) {
             entry["result"] = "skipped_virtual";
             results.push_back(std::move(entry));
@@ -1889,18 +1971,29 @@ namespace confighttp {
 
           const std::string target_id = device_instance_id(target);
           entry["target"] = target_id;
-          if (!handled_targets.insert(target_id).second) {
-            entry["result"] = "already_disabled";
+
+          auto known = target_result.find(target_id);
+          if (known != target_result.end()) {
+            entry["result"] = "duplicate";
+            entry["first_result"] = known->second;
             results.push_back(std::move(entry));
             continue;
           }
 
-          if (CONFIGRET cr = CM_Disable_DevNode(target, CM_DISABLE_UI_NOT_OK); cr != CR_SUCCESS) {
-            BOOST_LOG(warning) << "Input block: CM_Disable_DevNode failed ["sv << static_cast<unsigned long>(cr) << "] for "sv << target_id;
-            entry["result"] = std::format("error_{}", static_cast<unsigned long>(cr));
+          std::string result;
+          if (dry_run) {
+            ULONG status = 0;
+            ULONG problem = 0;
+            const bool already_disabled = CM_Get_DevNode_Status(&status, &problem, target, 0) == CR_SUCCESS &&
+                                          (status & DN_HAS_PROBLEM) != 0 && problem == CM_PROB_DISABLED;
+            result = already_disabled ? "already_disabled" : "would_disable";
           } else {
-            entry["result"] = "disabled";
+            result = disable_node(target, target_id);
           }
+          target_result.emplace(target_id, result);
+          entry["result"] = result;
+        } else if (dry_run) {
+          entry["result"] = device.disabled ? "would_enable" : "already_enabled";
         } else {
           entry["result"] = enable_device(device);
         }
@@ -1913,13 +2006,17 @@ namespace confighttp {
     apply_class(class_guid_mouse);
 
     if (enable) {
-      // Disabled bus parents hide their child collections, so re-enable any
-      // disabled USB HID-related nodes still present on the bus.
-      for (const auto &device : enumerate_disabled_usb_hid_nodes()) {
+      // Disabled parents/HID devices hide their child collections, so re-enable any
+      // disabled HID/USB input nodes still present on the bus.
+      for (const auto &device : enumerate_disabled_hid_bus_nodes()) {
         nlohmann::json entry;
         entry["name"] = device.name;
         entry["instance_id"] = device.instance_id;
-        entry["result"] = enable_device(device);
+        if (dry_run) {
+          entry["result"] = device.disabled ? "would_enable" : "already_enabled";
+        } else {
+          entry["result"] = enable_device(device);
+        }
         results.push_back(std::move(entry));
       }
     }
@@ -1999,7 +2096,7 @@ namespace confighttp {
       if (!input_block_active.load()) {
         break;
       }
-      apply_input_state(false);
+      apply_input_state(false, false);
     }
   }
 
@@ -2029,7 +2126,7 @@ namespace confighttp {
    */
   void self_heal_input_state() {
     std::lock_guard<std::mutex> lock(input_block_mutex);
-    apply_input_state(true);
+    apply_input_state(true, false);
     BOOST_LOG(info) << "Input block: startup self-heal restored physical input"sv;
   }
 
@@ -2042,7 +2139,7 @@ namespace confighttp {
     set_monitor_power(false);
     {
       std::lock_guard<std::mutex> lock(input_block_mutex);
-      apply_input_state(true);
+      apply_input_state(true, false);
     }
     BOOST_LOG(info) << "Input block: restored keyboard, mouse and display state"sv;
   }
@@ -2117,26 +2214,40 @@ namespace confighttp {
     nlohmann::json output_tree;
 
 #ifdef _WIN32
+    const bool dry_run = request_dry_run(request);
+
     nlohmann::json results;
-    {
+    if (dry_run) {
+      std::lock_guard<std::mutex> lock(input_block_mutex);
+      results = apply_input_state(false, true);
+    } else {
       stop_input_block_watchdog();
       std::lock_guard<std::mutex> lock(input_block_mutex);
-      results = apply_input_state(false);
+      results = apply_input_state(false, false);
     }
 
-    const int disabled_count = count_results(results, "disabled") + count_results(results, "already_disabled");
+    const int disabled_count = count_results(results, "disabled");
+    const int would_count = count_results(results, "would_disable");
+    const int already_disabled_count = count_results(results, "already_disabled");
     const int skipped_count = count_results(results, "skipped_virtual");
+    const int duplicate_count = count_results(results, "duplicate");
 
     output_tree["status"] = true;
-    output_tree["blocked"] = disabled_count > 0;
-    output_tree["blocked_count"] = disabled_count;
+    output_tree["dry_run"] = dry_run;
+    output_tree["blocked"] = dry_run ? (would_count + already_disabled_count) > 0 : disabled_count > 0;
+    output_tree["blocked_count"] = dry_run ? would_count : disabled_count;
     output_tree["skipped_virtual_count"] = skipped_count;
+    output_tree["duplicate_count"] = duplicate_count;
     output_tree["devices"] = results;
 
-    // Watchdog re-applies the block to catch newly plugged physical devices.
-    start_input_block_watchdog();
+    if (!dry_run) {
+      // Watchdog re-applies the block to catch newly plugged physical devices.
+      start_input_block_watchdog();
+    }
 
-    BOOST_LOG(info) << "Input block: physical keyboards and mice disabled ("sv << disabled_count << " devices, "sv << skipped_count << " virtual skipped)"sv;
+    BOOST_LOG(info) << (dry_run ? "Input block (dry-run)"sv : "Input block"sv)
+                    << ": physical keyboards and mice "sv << (dry_run ? "would be disabled"sv : "disabled"sv)
+                    << " ("sv << output_tree["blocked_count"].get<int>() << " devices, "sv << skipped_count << " virtual skipped)"sv;
 #else
     output_tree["status"] = false;
     output_tree["error"] = "Input blocking is only available on Windows";
@@ -2167,21 +2278,32 @@ namespace confighttp {
     nlohmann::json output_tree;
 
 #ifdef _WIN32
+    const bool dry_run = request_dry_run(request);
+
     nlohmann::json results;
-    {
+    if (dry_run) {
+      std::lock_guard<std::mutex> lock(input_block_mutex);
+      results = apply_input_state(true, true);
+    } else {
       stop_input_block_watchdog();
       std::lock_guard<std::mutex> lock(input_block_mutex);
-      results = apply_input_state(true);
+      results = apply_input_state(true, false);
     }
 
-    const int enabled_count = count_results(results, "enabled") + count_results(results, "already_enabled");
+    const int enabled_count = count_results(results, "enabled");
+    const int would_count = count_results(results, "would_enable");
+    const int already_count = count_results(results, "already_enabled");
 
     output_tree["status"] = true;
-    output_tree["blocked"] = false;
-    output_tree["unblocked_count"] = enabled_count;
+    output_tree["dry_run"] = dry_run;
+    output_tree["blocked"] = dry_run ? would_count > 0 : false;
+    output_tree["unblocked_count"] = dry_run ? would_count : enabled_count;
+    output_tree["already_enabled_count"] = already_count;
     output_tree["devices"] = results;
 
-    BOOST_LOG(info) << "Input unblock: physical keyboards and mice enabled ("sv << enabled_count << " devices)"sv;
+    BOOST_LOG(info) << (dry_run ? "Input unblock (dry-run)"sv : "Input unblock"sv)
+                    << ": physical keyboards and mice "sv << (dry_run ? "would be enabled"sv : "enabled"sv)
+                    << " ("sv << output_tree["unblocked_count"].get<int>() << " devices)"sv;
 #else
     output_tree["status"] = false;
     output_tree["error"] = "Input blocking is only available on Windows";

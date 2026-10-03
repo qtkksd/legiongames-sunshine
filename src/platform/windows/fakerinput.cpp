@@ -162,7 +162,7 @@ namespace fakerinput {
     DWORD written = 0;
     if (!WriteFile(endpoint_handle, version_report, sizeof(version_report), &written, nullptr)) {
       const DWORD error = GetLastError();
-      BOOST_LOG(warning) << "FakerInput: API version handshake failed: "sv << error;
+      BOOST_LOG(warning) << "FakerInput: API version handshake failed: " << error;
       shutdown();
       return false;
     }
