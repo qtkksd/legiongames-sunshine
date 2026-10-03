@@ -1858,18 +1858,31 @@ namespace confighttp {
     return result;
   }
 
+  bool setupdi_set_state(DEVINST devinst, DWORD state_change);
+  bool registry_enable(DEVINST devinst);
+  bool node_is_disabled(DEVINST devinst);
+
   /**
-   * @brief Enable a single device node, returning a result string.
+   * @brief Enable a single device node: CM API, then Device Manager path, then a
+   *        forced registry clear. Returns a result string.
    */
   std::string enable_device(const input_device_t &device) {
     if (!device.disabled) {
       return "already_enabled";
     }
-    if (CONFIGRET cr = CM_Enable_DevNode(device.devinst, 0); cr != CR_SUCCESS) {
-      BOOST_LOG(warning) << "Input unblock: CM_Enable_DevNode failed ["sv << static_cast<unsigned long>(cr) << "] for "sv << device.name;
-      return std::format("error_{}", static_cast<unsigned long>(cr));
+
+    if (CM_Enable_DevNode(device.devinst, 0) == CR_SUCCESS && !node_is_disabled(device.devinst)) {
+      return "enabled";
     }
-    return "enabled";
+    if (setupdi_set_state(device.devinst, DICS_ENABLE) && !node_is_disabled(device.devinst)) {
+      return "enabled";
+    }
+    if (registry_enable(device.devinst) && !node_is_disabled(device.devinst)) {
+      return "enabled";
+    }
+
+    BOOST_LOG(warning) << "Input unblock: could not enable "sv << device.name;
+    return "error_enable";
   }
 
   /**
@@ -1938,6 +1951,33 @@ namespace confighttp {
     DWORD type = 0;
     RegQueryValueExW(key, L"ConfigFlags", nullptr, &type, reinterpret_cast<LPBYTE>(&flags), &size);
     flags |= 0x00000001;  // CONFIGFLAG_DISABLED
+
+    const bool ok = RegSetValueExW(key, L"ConfigFlags", 0, REG_DWORD, reinterpret_cast<const BYTE *>(&flags), sizeof(flags)) == ERROR_SUCCESS;
+    RegCloseKey(key);
+
+    if (ok) {
+      CM_Reenumerate_DevNode(devinst, 0);
+    }
+    return ok;
+  }
+
+  /**
+   * @brief Clear a forced registry disable (CONFIGFLAG_DISABLED) and re-enumerate.
+   */
+  bool registry_enable(DEVINST devinst) {
+    HKEY key = nullptr;
+    if (CM_Open_DevNode_Key(devinst, KEY_QUERY_VALUE | KEY_SET_VALUE, 0, RegDisposition_OpenExisting, &key, CM_REGISTRY_HARDWARE) != CR_SUCCESS) {
+      return false;
+    }
+
+    DWORD flags = 0;
+    DWORD size = sizeof(flags);
+    DWORD type = 0;
+    if (RegQueryValueExW(key, L"ConfigFlags", nullptr, &type, reinterpret_cast<LPBYTE>(&flags), &size) != ERROR_SUCCESS) {
+      RegCloseKey(key);
+      return false;
+    }
+    flags &= ~static_cast<DWORD>(0x00000001);  // clear CONFIGFLAG_DISABLED
 
     const bool ok = RegSetValueExW(key, L"ConfigFlags", 0, REG_DWORD, reinterpret_cast<const BYTE *>(&flags), sizeof(flags)) == ERROR_SUCCESS;
     RegCloseKey(key);
