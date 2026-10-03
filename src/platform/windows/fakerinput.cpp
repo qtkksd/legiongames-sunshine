@@ -145,15 +145,24 @@ namespace fakerinput {
       return false;
     }
 
-    std::uint8_t version_report[CONTROL_REPORT_SIZE];
-    std::memset(version_report, 0, sizeof(version_report));
-    version_report[0] = REPORTID_CHECK_API_VERSION;
-    std::uint32_t api = FAKERINPUT_API_VERSION;
-    std::memcpy(version_report + 1, &api, sizeof(api));
+    // The driver casts the report buffer to FakerInputAPIVersionReport
+    // { BYTE ReportID; UINT32 ApiVersion; } with natural alignment, so the API
+    // version lives at offset 4 (3 bytes of padding after the report id byte).
+    struct api_version_report {
+      std::uint8_t report_id;
+      std::uint32_t api_version;
+    };
+    static_assert(sizeof(api_version_report) == 8, "unexpected struct padding");
+
+    alignas(api_version_report) std::uint8_t version_report[CONTROL_REPORT_SIZE] {};
+    auto *report = reinterpret_cast<api_version_report *>(version_report);
+    report->report_id = REPORTID_CHECK_API_VERSION;
+    report->api_version = FAKERINPUT_API_VERSION;
 
     DWORD written = 0;
     if (!WriteFile(endpoint_handle, version_report, sizeof(version_report), &written, nullptr)) {
-      BOOST_LOG(warning) << "FakerInput: API version handshake failed: " << GetLastError();
+      const DWORD error = GetLastError();
+      BOOST_LOG(warning) << "FakerInput: API version handshake failed: "sv << error;
       shutdown();
       return false;
     }
