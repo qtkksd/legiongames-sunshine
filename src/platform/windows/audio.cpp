@@ -14,6 +14,7 @@
 #include <newdev.h>
 #include <roapi.h>
 #include <synchapi.h>
+#include <winreg.h>
 
 // local includes
 #include "src/config.h"
@@ -54,6 +55,10 @@ namespace {
   constexpr auto SAMPLE_RATE = 48000;
 #ifdef STEAM_DRIVER_SUBDIR
   constexpr auto STEAM_AUDIO_DRIVER_PATH = L"%CommonProgramFiles(x86)%\\Steam\\drivers\\Windows10\\" STEAM_DRIVER_SUBDIR L"\\SteamStreamingSpeakers.inf";
+  // Steam Streaming Microphone driver, bundled with Sunshine. The mic feature is
+  // self-contained: it always installs from this bundled package and never relies
+  // on the driver package inside a local Steam installation.
+  constexpr auto STEAM_MIC_DRIVER_ASSET_PATH = SUNSHINE_ASSETS_DIR "/drivers/steam_mic/" "x64" "/SteamStreamingMicrophone.inf";
 #endif
 
   constexpr auto waveformat_mask_stereo = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
@@ -1094,6 +1099,20 @@ namespace platf::audio {
     }
 
     /**
+     * @brief Build matching fields for Steam Streaming Microphone.
+     *
+     * Matches the render endpoint of Steam's virtual microphone device, which is
+     * the endpoint the client-to-host microphone passthrough writes PCM into.
+     *
+     * @return Field list used to identify Steam's virtual microphone endpoint.
+     */
+    audio_control_t::match_fields_list_t match_steam_microphone() {
+      return {
+        {match_field_e::adapter_friendly_name, L"Steam Streaming Microphone"}
+      };
+    }
+
+    /**
      * @brief Build matching fields that all contain the same endpoint name.
      *
      * @param name Endpoint name or identifier to match across all fields.
@@ -1316,6 +1335,119 @@ namespace platf::audio {
     }
 
     /**
+     * @brief Checks whether a PnP device instance exists in the device store.
+     *
+     * Reads the device's key under the PnP Enum store. Unlike enumerating active
+     * audio endpoints, this detects a device that is installed but currently
+     * disabled or unplugged, so an installer can skip re-installing it.
+     *
+     * @param hardware_id Hardware identifier, e.g. `ROOT\\SteamStreamingMicrophone`.
+     * @return `true` if the device is already present in the device store.
+     */
+    static bool pnp_device_installed(const wchar_t *hardware_id) {
+      std::wstring enum_path = L"SYSTEM\\CurrentControlSet\\Enum\\";
+      enum_path += hardware_id;
+
+      HKEY key = nullptr;
+      if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, enum_path.c_str(), 0, KEY_READ, &key) == ERROR_SUCCESS) {
+        RegCloseKey(key);
+        return true;
+      }
+      return false;
+    }
+
+    /**
+     * @brief Resolves the bundled Steam Streaming Microphone driver INF.
+     *
+     * The microphone feature is self-contained: the driver is bundled in the
+     * Sunshine assets and installed from there. A local Steam installation is
+     * never consulted.
+     *
+     * @return Path to the INF, or `std::nullopt` if the bundled package is missing.
+     */
+    static std::optional<std::wstring> resolve_steam_microphone_driver() {
+#ifdef STEAM_DRIVER_SUBDIR
+      std::wstring bundled = utf_utils::from_utf8(STEAM_MIC_DRIVER_ASSET_PATH);
+      if (GetFileAttributesW(bundled.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return bundled;
+      }
+#endif
+      return std::nullopt;
+    }
+
+    /**
+     * @brief Installs the Steam Streaming Microphone driver if it is not present.
+     *
+     * Idempotent: if the device already exists in the device store, this is a
+     * no-op. Installs from the Sunshine-bundled driver package when available,
+     * otherwise from the local Steam driver package. Best-effort: failures are
+     * logged and do not abort startup.
+     *
+     * @return `true` if the device is installed (already present or newly installed).
+     */
+    bool install_steam_microphone_driver() {
+#ifdef STEAM_DRIVER_SUBDIR
+      // Do not install if the device is already registered, even if it is
+      // currently disabled or unplugged.
+      if (pnp_device_installed(L"ROOT\\SteamStreamingMicrophone")) {
+        BOOST_LOG(debug) << "Steam Streaming Microphone driver already installed"sv;
+        return true;
+      }
+
+      auto driver = resolve_steam_microphone_driver();
+      if (!driver) {
+        BOOST_LOG(warning) << "Bundled Steam Streaming Microphone driver is missing from the Sunshine assets "
+                              "'drivers/steam_mic/x64' directory"sv;
+        return false;
+      }
+
+      // MinGW's libnewdev.a is missing DiInstallDriverW() even though the headers have it,
+      // so we have to load it at runtime. It's Vista or later, so it will always be available.
+      auto newdev = LoadLibraryExW(L"newdev.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+      if (!newdev) {
+        BOOST_LOG(error) << "newdev.dll failed to load"sv;
+        return false;
+      }
+      auto fg = util::fail_guard([newdev]() {
+        FreeLibrary(newdev);
+      });
+
+      auto fn_DiInstallDriverW = (decltype(DiInstallDriverW) *) GetProcAddress(newdev, "DiInstallDriverW");
+      if (!fn_DiInstallDriverW) {
+        BOOST_LOG(error) << "DiInstallDriverW() is missing"sv;
+        return false;
+      }
+
+      if (fn_DiInstallDriverW(nullptr, driver->c_str(), 0, nullptr)) {
+        BOOST_LOG(info) << "Successfully installed Steam Streaming Microphone"sv;
+
+        // Give the audio subsystem a moment to enumerate the new endpoint.
+        Sleep(3000);
+        return true;
+      }
+
+      auto err = GetLastError();
+      switch (err) {
+        case ERROR_ACCESS_DENIED:
+          BOOST_LOG(warning) << "Administrator privileges are required to install Steam Streaming Microphone"sv;
+          break;
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+          BOOST_LOG(warning) << "Steam Streaming Microphone driver files not found"sv;
+          break;
+        default:
+          BOOST_LOG(warning) << "Failed to install Steam Streaming Microphone driver: "sv << err;
+          break;
+      }
+
+      return false;
+#else
+      BOOST_LOG(warning) << "Unable to install Steam Streaming Microphone on unknown architecture"sv;
+      return false;
+#endif
+    }
+
+    /**
      * @brief Initialize Windows audio policy interfaces.
      *
      * @return 0 on success; nonzero or negative platform status on failure.
@@ -1387,6 +1519,13 @@ namespace platf {
     if (config::audio.install_steam_drivers && !control->find_device_id(control->match_steam_speakers())) {
       // This is best effort. Don't fail if it doesn't work.
       control->install_steam_audio_drivers();
+    }
+
+    // Install the Steam Streaming Microphone driver if needed. This provides the
+    // virtual recording device used by client-to-host microphone passthrough.
+    // Best effort and idempotent (skipped when the device is already present).
+    if (config::audio.install_steam_drivers) {
+      control->install_steam_microphone_driver();
     }
 
     return control;
