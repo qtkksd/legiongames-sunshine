@@ -805,6 +805,25 @@ namespace platf {
     virtual int set_sink(const std::string &sink) = 0;
 
     /**
+     * @brief Make the platform's virtual microphone the default capture device.
+     *
+     * Defaults to a no-op; implemented by platforms that provide a virtual mic.
+     *
+     * @return `true` if the default capture device was changed.
+     */
+    virtual bool set_default_microphone() {
+      return false;
+    }
+
+    /**
+     * @brief Restore the capture device that was default before the session.
+     *
+     * Defaults to a no-op; implemented by platforms that provide a virtual mic.
+     */
+    virtual void restore_default_microphone() {
+    }
+
+    /**
      * @brief Create a microphone capture stream for the requested layout.
      *
      * @param mapping Opus channel mapping table for the requested layout.

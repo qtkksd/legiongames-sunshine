@@ -79,11 +79,14 @@ namespace audio {
   struct audio_ctx_t {
     // We want to change the sink for the first stream only
     std::unique_ptr<std::atomic_bool> sink_flag;  ///< Tracks whether the capture sink was already switched.
+    // We want to change the default microphone for the first stream only
+    std::unique_ptr<std::atomic_bool> mic_flag;  ///< Tracks whether the default microphone was already switched.
 
     std::unique_ptr<platf::audio_control_t> control;  ///< Platform audio-control implementation.
 
     bool restore_sink;  ///< Whether Sunshine should restore the original sink when capture ends.
     platf::sink_t sink;  ///< Original sink captured before Sunshine switched devices.
+    bool restore_mic;  ///< Whether Sunshine should restore the original default microphone when capture ends.
   };
 
   /**

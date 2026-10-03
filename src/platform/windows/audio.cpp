@@ -439,6 +439,27 @@ namespace platf::audio {
   }
 
   /**
+   * @brief Query the default Windows capture endpoint.
+   *
+   * @param device_enum Windows multimedia device enumerator.
+   * @return Default capture endpoint, or an empty handle if lookup fails.
+   */
+  device_t default_capture_device(device_enum_t &device_enum) {
+    device_t device;
+    HRESULT status = device_enum->GetDefaultAudioEndpoint(
+      eCapture,
+      eConsole,
+      &device
+    );
+
+    if (FAILED(status)) {
+      return nullptr;
+    }
+
+    return device;
+  }
+
+  /**
    * @brief Windows audio endpoint notification callback registered with MMDevice.
    */
   class audio_notification_t: public ::IMMNotificationClient {
@@ -499,6 +520,8 @@ namespace platf::audio {
     HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR pwstrDeviceId) {
       if (flow == eRender) {
         default_render_device_changed_flag.store(true);
+      } else if (flow == eCapture) {
+        default_capture_device_changed_flag.store(true);
       }
       return S_OK;
     }
@@ -559,8 +582,17 @@ namespace platf::audio {
       return default_render_device_changed_flag.exchange(false);
     }
 
+    /**
+     * @brief Checks if the default capture device changed and resets the change flag
+     * @return `true` if the capture device changed since last call
+     */
+    bool check_default_capture_device_changed() {
+      return default_capture_device_changed_flag.exchange(false);
+    }
+
   private:
     std::atomic_bool default_render_device_changed_flag;
+    std::atomic_bool default_capture_device_changed_flag;
   };
 
   /**
@@ -755,6 +787,15 @@ namespace platf::audio {
         return capture_e::reinit;
       }
 
+      // Check if the default capture device changed. This is unrelated to the
+      // loopback render capture above, so re-assert the session's default
+      // microphone without reinitializing.
+      if (endpt_notification.check_default_capture_device_changed()) {
+        if (capture_endpt_changed_cb) {
+          (*capture_endpt_changed_cb)();
+        }
+      }
+
       status = WaitForSingleObjectEx(audio_event.get(), default_latency_ms, FALSE);
       switch (status) {
         case WAIT_OBJECT_0:
@@ -834,6 +875,7 @@ namespace platf::audio {
 
     audio_notification_t endpt_notification;  ///< Endpoint notification callback registered with Windows.
     std::optional<std::function<void()>> default_endpt_changed_cb;  ///< Callback invoked when the default endpoint changes.
+    std::optional<std::function<void()>> capture_endpt_changed_cb;  ///< Callback invoked when the default capture endpoint changes.
 
     REFERENCE_TIME default_latency_ms;  ///< WASAPI default device period used as capture latency.
 
@@ -958,6 +1000,11 @@ namespace platf::audio {
           set_sink(assigned_sink);
         };
       }
+
+      // Re-assert the session's default microphone if another app changes it.
+      mic->capture_endpt_changed_cb = [this] {
+        reassert_default_microphone();
+      };
 
       return mic;
     }
@@ -1132,13 +1179,13 @@ namespace platf::audio {
      * @param match_list Pairs of match fields and values
      * @return Optional pair of matched field and device_id
      */
-    std::optional<matched_field_t> find_device_id(const match_fields_list_t &match_list) {
+    std::optional<matched_field_t> find_device_id(const match_fields_list_t &match_list, EDataFlow flow = eRender) {
       if (match_list.empty()) {
         return std::nullopt;
       }
 
       collection_t collection;
-      auto status = device_enum->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection);
+      auto status = device_enum->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, &collection);
       if (FAILED(status)) {
         BOOST_LOG(error) << "Couldn't enumerate: [0x"sv << util::hex(status).to_string_view() << ']';
         return std::nullopt;
@@ -1261,6 +1308,175 @@ namespace platf::audio {
       }
 
       BOOST_LOG(info) << "Successfully reset default audio device"sv;
+    }
+
+    /**
+     * @brief Point the default capture device at the Steam Streaming Microphone.
+     *
+     * Sets the virtual microphone as the default for every role. This is the
+     * recording-direction counterpart of set_sink().
+     *
+     * @return `true` if every role was set.
+     */
+    bool apply_steam_microphone_default() {
+      auto matched = find_device_id(match_steam_microphone(), eCapture);
+      if (!matched) {
+        BOOST_LOG(warning) << "Steam Streaming Microphone not available; default microphone unchanged"sv;
+        return false;
+      }
+
+      int failure = 0;
+      for (int x = 0; x < (int) ERole_enum_count; ++x) {
+        auto status = policy->SetDefaultEndpoint(matched->second.c_str(), (ERole) x);
+        if (status) {
+          BOOST_LOG(warning) << "Couldn't set Steam Streaming Microphone to role ["sv << x << "]: 0x"sv << util::hex(status).to_string_view();
+          ++failure;
+        }
+      }
+
+      return failure == 0;
+    }
+
+    /**
+     * @brief Makes the Steam Streaming Microphone the default capture device.
+     *
+     * Mirrors set_sink() for the recording direction: saves the current default
+     * capture endpoint and switches to the Steam microphone. The saved endpoint
+     * is restored by restore_default_microphone() at session end.
+     *
+     * @return `true` if the default capture device was changed.
+     */
+    bool set_default_microphone() override {
+      if (mic_default_assigned) {
+        return true;
+      }
+
+      // Remember the current default capture device so it can be restored later.
+      assigned_mic.clear();
+      auto current = default_capture_device(device_enum);
+      if (current) {
+        audio::wstring_t current_id;
+        current->GetId(&current_id);
+        assigned_mic = current_id.get();
+      }
+
+      if (!apply_steam_microphone_default()) {
+        return false;
+      }
+
+      mic_default_assigned = true;
+      BOOST_LOG(info) << "Set Steam Streaming Microphone as the default capture device"sv;
+      return true;
+    }
+
+    /**
+     * @brief Re-applies the Steam Streaming Microphone as the default capture device.
+     *
+     * Invoked when another application changes the default capture device during
+     * a session, mirroring the Steam Streaming Speakers re-assert behaviour.
+     */
+    void reassert_default_microphone() {
+      if (mic_default_assigned) {
+        apply_steam_microphone_default();
+      }
+    }
+
+    /**
+     * @brief Restores the default capture device that was active before the session.
+     */
+    void restore_default_microphone() override {
+      if (!mic_default_assigned) {
+        return;
+      }
+      mic_default_assigned = false;
+
+      // If nothing was saved, hide the Steam mic briefly so Windows picks a default.
+      if (assigned_mic.empty()) {
+        auto matched = find_device_id(match_steam_microphone(), eCapture);
+        if (matched) {
+          policy->SetEndpointVisibility(matched->second.c_str(), FALSE);
+          auto new_default = default_capture_device(device_enum);
+          if (new_default) {
+            audio::wstring_t new_id;
+            new_default->GetId(&new_id);
+            for (int x = 0; x < (int) ERole_enum_count; ++x) {
+              policy->SetDefaultEndpoint(new_id.get(), (ERole) x);
+            }
+          }
+          policy->SetEndpointVisibility(matched->second.c_str(), TRUE);
+        }
+        return;
+      }
+
+      int failure = 0;
+      for (int x = 0; x < (int) ERole_enum_count; ++x) {
+        if (policy->SetDefaultEndpoint(assigned_mic.c_str(), (ERole) x)) {
+          ++failure;
+        }
+      }
+
+      assigned_mic.clear();
+      if (failure) {
+        BOOST_LOG(warning) << "Couldn't fully restore the default capture device"sv;
+      } else {
+        BOOST_LOG(info) << "Restored the default capture device"sv;
+      }
+    }
+
+    /**
+     * @brief Resets a Steam Streaming Microphone default left over from a crash.
+     *
+     * Mirror of reset_default_device() for the recording direction: if the Steam
+     * microphone is the default capture device at startup, hide it briefly so
+     * Windows picks another default, then re-enable it.
+     */
+    void reset_default_microphone() {
+      auto matched = find_device_id(match_steam_microphone(), eCapture);
+      if (!matched) {
+        return;
+      }
+      const auto steam_device_id = matched->second;
+
+      auto current_default_dev = default_capture_device(device_enum);
+      if (!current_default_dev) {
+        return;
+      }
+
+      audio::wstring_t current_default_id;
+      current_default_dev->GetId(&current_default_id);
+
+      // If the Steam microphone is not the default, there is nothing to reset.
+      if (steam_device_id != current_default_id.get()) {
+        return;
+      }
+
+      // Hide the Steam microphone temporarily so the OS picks another default.
+      auto hr = policy->SetEndpointVisibility(steam_device_id.c_str(), FALSE);
+      if (FAILED(hr)) {
+        BOOST_LOG(warning) << "Failed to disable Steam microphone device: "sv << util::hex(hr).to_string_view();
+        return;
+      }
+
+      auto new_default_dev = default_capture_device(device_enum);
+
+      // Re-enable the Steam microphone.
+      hr = policy->SetEndpointVisibility(steam_device_id.c_str(), TRUE);
+      if (FAILED(hr)) {
+        BOOST_LOG(warning) << "Failed to enable Steam microphone device: "sv << util::hex(hr).to_string_view();
+        return;
+      }
+
+      if (!new_default_dev) {
+        return;
+      }
+
+      audio::wstring_t new_default_id;
+      new_default_dev->GetId(&new_default_id);
+      for (int x = 0; x < (int) ERole_enum_count; ++x) {
+        policy->SetDefaultEndpoint(new_default_id.get(), (ERole) x);
+      }
+
+      BOOST_LOG(info) << "Successfully reset default microphone"sv;
     }
 
     /**
@@ -1492,6 +1708,8 @@ namespace platf::audio {
     policy_t policy;  ///< Windows policy configuration interface used to switch default audio devices.
     audio::device_enum_t device_enum;  ///< Device enumerator used to query and watch audio endpoints.
     std::string assigned_sink;  ///< Virtual sink assigned while Sunshine captures host audio.
+    std::wstring assigned_mic;  ///< Default capture device saved before Sunshine switched to the Steam microphone.
+    bool mic_default_assigned = false;  ///< Whether Sunshine switched the default microphone this session.
   };
 }  // namespace platf::audio
 
@@ -1544,6 +1762,7 @@ namespace platf {
     audio::audio_control_t audio_ctrl;
     if (audio_ctrl.init() == 0) {
       audio_ctrl.reset_default_device();
+      audio_ctrl.reset_default_microphone();
     }
 
     return co_init;
