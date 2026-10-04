@@ -1845,6 +1845,17 @@ namespace confighttp {
     return cycle_port(hub_id, port);
   }
 
+  /** @brief Trigger a global device rescan ("Scan for hardware changes"). */
+  void rescan_devices() {
+    std::error_code ec;
+    boost::filesystem::path working_dir;
+    boost::process::v1::environment env = boost::this_process::environment();
+    auto child = platf::run_command(true, false, "pnputil /scan-devices", working_dir, env, nullptr, ec, nullptr);
+    if (!ec && child.valid()) {
+      child.wait(ec);
+    }
+  }
+
   /**
    * @brief Whether the node is a USB hub or root hub (never disable these).
    */
@@ -2510,28 +2521,39 @@ namespace confighttp {
    * @return True when the target was restored (or re-enumerated via its parent).
    */
   bool restore_target(const blocked_target_t &target) {
-    // Removed/ejected: software replug by cycling the recorded hub port. This works
-    // even when the device node is already gone (phantom), unlike a parent
-    // re-enumerate which does not reliably re-attach a removed USB device.
-    if ((target.method == "removed" || target.method == "ejected") && !target.hub_id.empty()) {
-      if (cycle_port(target.hub_id, target.port)) {
-        return true;
-      }
-    }
-
     std::wstring wide(target.instance_id.begin(), target.instance_id.end());
 
-    // Present node: restore in place.
+    // Removed/ejected: the target's SUBTREE was removed, so its children (USB
+    // interfaces / HID collections) go phantom even though the target node itself
+    // can still report OK. A plain "is it enabled?" check wrongly succeeds here, so
+    // we must restart the target to make its children re-attach.
+    if (target.method == "removed" || target.method == "ejected") {
+      DEVINST devinst = 0;
+      if (CM_Locate_DevNodeW(&devinst, wide.data(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS) {
+        CM_Reenumerate_DevNode(devinst, CM_REENUMERATE_SYNCHRONOUS);
+      }
+      if (!target.parent_id.empty()) {
+        std::wstring wide_parent(target.parent_id.begin(), target.parent_id.end());
+        DEVINST parent = 0;
+        if (CM_Locate_DevNodeW(&parent, wide_parent.data(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS) {
+          CM_Reenumerate_DevNode(parent, CM_REENUMERATE_SYNCHRONOUS);
+        }
+      }
+      if (!target.hub_id.empty() && target.port != 0) {
+        cycle_port(target.hub_id, target.port);
+      }
+      // Global rescan ("Scan for hardware changes") re-creates phantom children.
+      rescan_devices();
+      return true;
+    }
+
+    // disabled/legacy: restore in place, then re-enumerate the parent as a fallback.
     DEVINST devinst = 0;
     if (CM_Locate_DevNodeW(&devinst, wide.data(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS) {
-      if (restore_node(devinst, target.method == "ejected")) {
+      if (restore_node(devinst, false)) {
         return true;
       }
     }
-
-    // Removed/ejected node (now phantom): re-enumerate the recorded parent so the
-    // child re-attaches. A phantom has no block problem code, so restore_node alone
-    // would wrongly report success without actually bringing the device back.
     if (!target.parent_id.empty()) {
       std::wstring wide_parent(target.parent_id.begin(), target.parent_id.end());
       DEVINST parent = 0;
