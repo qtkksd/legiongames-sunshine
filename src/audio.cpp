@@ -219,6 +219,13 @@ namespace audio {
       }
     }
 
+    // Only the first to start a session may change the default microphone.
+    // Mirror the sink handling: switch the Windows default capture device to the
+    // Steam Streaming Microphone for the session and restore it when capture ends.
+    if (!ref->mic_flag->exchange(true, std::memory_order_acquire)) {
+      ref->restore_mic = control->set_default_microphone();
+    }
+
     auto frame_size = config.packetDuration * stream.sampleRate / 1000;
     bool host_audio = config.flags[config_t::HOST_AUDIO];
     bool continuous_audio = config.flags[config_t::CONTINUOUS_AUDIO];
@@ -313,9 +320,12 @@ namespace audio {
     });
 
     ctx.sink_flag = std::make_unique<std::atomic_bool>(false);
+    ctx.mic_flag = std::make_unique<std::atomic_bool>(false);
 
     // The default sink has not been replaced yet.
     ctx.restore_sink = false;
+    // The default microphone has not been replaced yet.
+    ctx.restore_mic = false;
 
     if (!(ctx.control = platf::audio_control())) {
       return 0;
@@ -335,6 +345,13 @@ namespace audio {
   }
 
   void stop_audio_control(audio_ctx_t &ctx) {
+    // Restore the default microphone first (independent of the sink restore).
+    if (ctx.restore_mic && ctx.control) {
+      // Best effort, it's allowed to fail
+      ctx.control->restore_default_microphone();
+      ctx.restore_mic = false;
+    }
+
     // restore audio-sink if applicable
     if (!ctx.restore_sink) {
       return;

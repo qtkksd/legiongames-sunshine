@@ -14,6 +14,7 @@
 #include <newdev.h>
 #include <roapi.h>
 #include <synchapi.h>
+#include <winreg.h>
 
 // local includes
 #include "src/config.h"
@@ -54,6 +55,10 @@ namespace {
   constexpr auto SAMPLE_RATE = 48000;
 #ifdef STEAM_DRIVER_SUBDIR
   constexpr auto STEAM_AUDIO_DRIVER_PATH = L"%CommonProgramFiles(x86)%\\Steam\\drivers\\Windows10\\" STEAM_DRIVER_SUBDIR L"\\SteamStreamingSpeakers.inf";
+  // Steam Streaming Microphone driver, bundled with Sunshine. The mic feature is
+  // self-contained: it always installs from this bundled package and never relies
+  // on the driver package inside a local Steam installation.
+  constexpr auto STEAM_MIC_DRIVER_ASSET_PATH = SUNSHINE_ASSETS_DIR "/drivers/steam_mic/" "x64" "/SteamStreamingMicrophone.inf";
 #endif
 
   constexpr auto waveformat_mask_stereo = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
@@ -434,6 +439,27 @@ namespace platf::audio {
   }
 
   /**
+   * @brief Query the default Windows capture endpoint.
+   *
+   * @param device_enum Windows multimedia device enumerator.
+   * @return Default capture endpoint, or an empty handle if lookup fails.
+   */
+  device_t default_capture_device(device_enum_t &device_enum) {
+    device_t device;
+    HRESULT status = device_enum->GetDefaultAudioEndpoint(
+      eCapture,
+      eConsole,
+      &device
+    );
+
+    if (FAILED(status)) {
+      return nullptr;
+    }
+
+    return device;
+  }
+
+  /**
    * @brief Windows audio endpoint notification callback registered with MMDevice.
    */
   class audio_notification_t: public ::IMMNotificationClient {
@@ -494,6 +520,8 @@ namespace platf::audio {
     HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR pwstrDeviceId) {
       if (flow == eRender) {
         default_render_device_changed_flag.store(true);
+      } else if (flow == eCapture) {
+        default_capture_device_changed_flag.store(true);
       }
       return S_OK;
     }
@@ -554,8 +582,17 @@ namespace platf::audio {
       return default_render_device_changed_flag.exchange(false);
     }
 
+    /**
+     * @brief Checks if the default capture device changed and resets the change flag
+     * @return `true` if the capture device changed since last call
+     */
+    bool check_default_capture_device_changed() {
+      return default_capture_device_changed_flag.exchange(false);
+    }
+
   private:
     std::atomic_bool default_render_device_changed_flag;
+    std::atomic_bool default_capture_device_changed_flag;
   };
 
   /**
@@ -750,6 +787,15 @@ namespace platf::audio {
         return capture_e::reinit;
       }
 
+      // Check if the default capture device changed. This is unrelated to the
+      // loopback render capture above, so re-assert the session's default
+      // microphone without reinitializing.
+      if (endpt_notification.check_default_capture_device_changed()) {
+        if (capture_endpt_changed_cb) {
+          (*capture_endpt_changed_cb)();
+        }
+      }
+
       status = WaitForSingleObjectEx(audio_event.get(), default_latency_ms, FALSE);
       switch (status) {
         case WAIT_OBJECT_0:
@@ -829,6 +875,7 @@ namespace platf::audio {
 
     audio_notification_t endpt_notification;  ///< Endpoint notification callback registered with Windows.
     std::optional<std::function<void()>> default_endpt_changed_cb;  ///< Callback invoked when the default endpoint changes.
+    std::optional<std::function<void()>> capture_endpt_changed_cb;  ///< Callback invoked when the default capture endpoint changes.
 
     REFERENCE_TIME default_latency_ms;  ///< WASAPI default device period used as capture latency.
 
@@ -953,6 +1000,11 @@ namespace platf::audio {
           set_sink(assigned_sink);
         };
       }
+
+      // Re-assert the session's default microphone if another app changes it.
+      mic->capture_endpt_changed_cb = [this] {
+        reassert_default_microphone();
+      };
 
       return mic;
     }
@@ -1094,6 +1146,20 @@ namespace platf::audio {
     }
 
     /**
+     * @brief Build matching fields for Steam Streaming Microphone.
+     *
+     * Matches the render endpoint of Steam's virtual microphone device, which is
+     * the endpoint the client-to-host microphone passthrough writes PCM into.
+     *
+     * @return Field list used to identify Steam's virtual microphone endpoint.
+     */
+    audio_control_t::match_fields_list_t match_steam_microphone() {
+      return {
+        {match_field_e::adapter_friendly_name, L"Steam Streaming Microphone"}
+      };
+    }
+
+    /**
      * @brief Build matching fields that all contain the same endpoint name.
      *
      * @param name Endpoint name or identifier to match across all fields.
@@ -1113,13 +1179,13 @@ namespace platf::audio {
      * @param match_list Pairs of match fields and values
      * @return Optional pair of matched field and device_id
      */
-    std::optional<matched_field_t> find_device_id(const match_fields_list_t &match_list) {
+    std::optional<matched_field_t> find_device_id(const match_fields_list_t &match_list, EDataFlow flow = eRender) {
       if (match_list.empty()) {
         return std::nullopt;
       }
 
       collection_t collection;
-      auto status = device_enum->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection);
+      auto status = device_enum->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, &collection);
       if (FAILED(status)) {
         BOOST_LOG(error) << "Couldn't enumerate: [0x"sv << util::hex(status).to_string_view() << ']';
         return std::nullopt;
@@ -1245,6 +1311,175 @@ namespace platf::audio {
     }
 
     /**
+     * @brief Point the default capture device at the Steam Streaming Microphone.
+     *
+     * Sets the virtual microphone as the default for every role. This is the
+     * recording-direction counterpart of set_sink().
+     *
+     * @return `true` if every role was set.
+     */
+    bool apply_steam_microphone_default() {
+      auto matched = find_device_id(match_steam_microphone(), eCapture);
+      if (!matched) {
+        BOOST_LOG(warning) << "Steam Streaming Microphone not available; default microphone unchanged"sv;
+        return false;
+      }
+
+      int failure = 0;
+      for (int x = 0; x < (int) ERole_enum_count; ++x) {
+        auto status = policy->SetDefaultEndpoint(matched->second.c_str(), (ERole) x);
+        if (status) {
+          BOOST_LOG(warning) << "Couldn't set Steam Streaming Microphone to role ["sv << x << "]: 0x"sv << util::hex(status).to_string_view();
+          ++failure;
+        }
+      }
+
+      return failure == 0;
+    }
+
+    /**
+     * @brief Makes the Steam Streaming Microphone the default capture device.
+     *
+     * Mirrors set_sink() for the recording direction: saves the current default
+     * capture endpoint and switches to the Steam microphone. The saved endpoint
+     * is restored by restore_default_microphone() at session end.
+     *
+     * @return `true` if the default capture device was changed.
+     */
+    bool set_default_microphone() override {
+      if (mic_default_assigned) {
+        return true;
+      }
+
+      // Remember the current default capture device so it can be restored later.
+      assigned_mic.clear();
+      auto current = default_capture_device(device_enum);
+      if (current) {
+        audio::wstring_t current_id;
+        current->GetId(&current_id);
+        assigned_mic = current_id.get();
+      }
+
+      if (!apply_steam_microphone_default()) {
+        return false;
+      }
+
+      mic_default_assigned = true;
+      BOOST_LOG(info) << "Set Steam Streaming Microphone as the default capture device"sv;
+      return true;
+    }
+
+    /**
+     * @brief Re-applies the Steam Streaming Microphone as the default capture device.
+     *
+     * Invoked when another application changes the default capture device during
+     * a session, mirroring the Steam Streaming Speakers re-assert behaviour.
+     */
+    void reassert_default_microphone() {
+      if (mic_default_assigned) {
+        apply_steam_microphone_default();
+      }
+    }
+
+    /**
+     * @brief Restores the default capture device that was active before the session.
+     */
+    void restore_default_microphone() override {
+      if (!mic_default_assigned) {
+        return;
+      }
+      mic_default_assigned = false;
+
+      // If nothing was saved, hide the Steam mic briefly so Windows picks a default.
+      if (assigned_mic.empty()) {
+        auto matched = find_device_id(match_steam_microphone(), eCapture);
+        if (matched) {
+          policy->SetEndpointVisibility(matched->second.c_str(), FALSE);
+          auto new_default = default_capture_device(device_enum);
+          if (new_default) {
+            audio::wstring_t new_id;
+            new_default->GetId(&new_id);
+            for (int x = 0; x < (int) ERole_enum_count; ++x) {
+              policy->SetDefaultEndpoint(new_id.get(), (ERole) x);
+            }
+          }
+          policy->SetEndpointVisibility(matched->second.c_str(), TRUE);
+        }
+        return;
+      }
+
+      int failure = 0;
+      for (int x = 0; x < (int) ERole_enum_count; ++x) {
+        if (policy->SetDefaultEndpoint(assigned_mic.c_str(), (ERole) x)) {
+          ++failure;
+        }
+      }
+
+      assigned_mic.clear();
+      if (failure) {
+        BOOST_LOG(warning) << "Couldn't fully restore the default capture device"sv;
+      } else {
+        BOOST_LOG(info) << "Restored the default capture device"sv;
+      }
+    }
+
+    /**
+     * @brief Resets a Steam Streaming Microphone default left over from a crash.
+     *
+     * Mirror of reset_default_device() for the recording direction: if the Steam
+     * microphone is the default capture device at startup, hide it briefly so
+     * Windows picks another default, then re-enable it.
+     */
+    void reset_default_microphone() {
+      auto matched = find_device_id(match_steam_microphone(), eCapture);
+      if (!matched) {
+        return;
+      }
+      const auto steam_device_id = matched->second;
+
+      auto current_default_dev = default_capture_device(device_enum);
+      if (!current_default_dev) {
+        return;
+      }
+
+      audio::wstring_t current_default_id;
+      current_default_dev->GetId(&current_default_id);
+
+      // If the Steam microphone is not the default, there is nothing to reset.
+      if (steam_device_id != current_default_id.get()) {
+        return;
+      }
+
+      // Hide the Steam microphone temporarily so the OS picks another default.
+      auto hr = policy->SetEndpointVisibility(steam_device_id.c_str(), FALSE);
+      if (FAILED(hr)) {
+        BOOST_LOG(warning) << "Failed to disable Steam microphone device: "sv << util::hex(hr).to_string_view();
+        return;
+      }
+
+      auto new_default_dev = default_capture_device(device_enum);
+
+      // Re-enable the Steam microphone.
+      hr = policy->SetEndpointVisibility(steam_device_id.c_str(), TRUE);
+      if (FAILED(hr)) {
+        BOOST_LOG(warning) << "Failed to enable Steam microphone device: "sv << util::hex(hr).to_string_view();
+        return;
+      }
+
+      if (!new_default_dev) {
+        return;
+      }
+
+      audio::wstring_t new_default_id;
+      new_default_dev->GetId(&new_default_id);
+      for (int x = 0; x < (int) ERole_enum_count; ++x) {
+        policy->SetDefaultEndpoint(new_default_id.get(), (ERole) x);
+      }
+
+      BOOST_LOG(info) << "Successfully reset default microphone"sv;
+    }
+
+    /**
      * @brief Installs the Steam Streaming Speakers driver, if present.
      * @return `true` if installation was successful.
      */
@@ -1316,6 +1551,144 @@ namespace platf::audio {
     }
 
     /**
+     * @brief Checks whether a PnP device instance exists in the device store.
+     *
+     * Reads the device's key under the PnP Enum store. Unlike enumerating active
+     * audio endpoints, this detects a device that is installed but currently
+     * disabled or unplugged, so an installer can skip re-installing it.
+     *
+     * @param hardware_id Hardware identifier, e.g. `ROOT\\SteamStreamingMicrophone`.
+     * @return `true` if the device is already present in the device store.
+     */
+    static bool pnp_device_installed(const wchar_t *hardware_id) {
+      std::wstring enum_path = L"SYSTEM\\CurrentControlSet\\Enum\\";
+      enum_path += hardware_id;
+
+      HKEY key = nullptr;
+      if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, enum_path.c_str(), 0, KEY_READ, &key) == ERROR_SUCCESS) {
+        RegCloseKey(key);
+        return true;
+      }
+      return false;
+    }
+
+    /**
+     * @brief Resolves the bundled Steam Streaming Microphone driver INF.
+     *
+     * The microphone feature is self-contained: the driver is bundled in the
+     * Sunshine assets and installed from there. A local Steam installation is
+     * never consulted.
+     *
+     * @return Path to the INF, or `std::nullopt` if the bundled package is missing.
+     */
+    static std::optional<std::wstring> resolve_steam_microphone_driver() {
+#ifdef STEAM_DRIVER_SUBDIR
+      std::wstring bundled = utf_utils::from_utf8(STEAM_MIC_DRIVER_ASSET_PATH);
+      if (GetFileAttributesW(bundled.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return bundled;
+      }
+#endif
+      return std::nullopt;
+    }
+
+    /**
+     * @brief Installs the Steam Streaming Microphone driver if it is not present.
+     *
+     * Idempotent: if the device already exists in the device store, this is a
+     * no-op. Installs from the Sunshine-bundled driver package when available,
+     * otherwise from the local Steam driver package. Best-effort: failures are
+     * logged and do not abort startup.
+     *
+     * @return `true` if the device is installed (already present or newly installed).
+     */
+    /**
+     * @brief Force the Steam Streaming Microphone endpoint to 48 kHz / 2 ch / 32-bit float.
+     *
+     * The client-to-host mic wire format is 48 kHz mono s16. Pinning the endpoint
+     * to a 48 kHz float stereo format avoids sample-rate/bit-depth mismatches
+     * that otherwise cause pitch shifts or noise. Best effort.
+     */
+    void set_microphone_format() {
+      auto matched = find_device_id(match_steam_microphone());
+      if (!matched) {
+        return;
+      }
+
+      auto waveformat = create_waveformat(sample_format_e::f32, 2, waveformat_mask_stereo);
+      WAVEFORMATEXTENSIBLE closest {};
+      auto hr = policy->SetDeviceFormat(matched->second.c_str(), (WAVEFORMATEX *) &waveformat, (WAVEFORMATEX *) &closest);
+      if (FAILED(hr)) {
+        BOOST_LOG(warning) << "Couldn't set Steam Streaming Microphone format: 0x"sv << util::hex(hr).to_string_view();
+      } else {
+        BOOST_LOG(info) << "Set Steam Streaming Microphone format to 48 kHz / 2 ch / 32-bit float"sv;
+      }
+    }
+
+    bool install_steam_microphone_driver() {
+#ifdef STEAM_DRIVER_SUBDIR
+      // Do not install if the device is already registered, even if it is
+      // currently disabled or unplugged.
+      if (pnp_device_installed(L"ROOT\\SteamStreamingMicrophone")) {
+        BOOST_LOG(debug) << "Steam Streaming Microphone driver already installed"sv;
+        set_microphone_format();
+        return true;
+      }
+
+      auto driver = resolve_steam_microphone_driver();
+      if (!driver) {
+        BOOST_LOG(warning) << "Bundled Steam Streaming Microphone driver is missing from the Sunshine assets "
+                              "'drivers/steam_mic/x64' directory"sv;
+        return false;
+      }
+
+      // MinGW's libnewdev.a is missing DiInstallDriverW() even though the headers have it,
+      // so we have to load it at runtime. It's Vista or later, so it will always be available.
+      auto newdev = LoadLibraryExW(L"newdev.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+      if (!newdev) {
+        BOOST_LOG(error) << "newdev.dll failed to load"sv;
+        return false;
+      }
+      auto fg = util::fail_guard([newdev]() {
+        FreeLibrary(newdev);
+      });
+
+      auto fn_DiInstallDriverW = (decltype(DiInstallDriverW) *) GetProcAddress(newdev, "DiInstallDriverW");
+      if (!fn_DiInstallDriverW) {
+        BOOST_LOG(error) << "DiInstallDriverW() is missing"sv;
+        return false;
+      }
+
+      if (fn_DiInstallDriverW(nullptr, driver->c_str(), 0, nullptr)) {
+        BOOST_LOG(info) << "Successfully installed Steam Streaming Microphone"sv;
+
+        // Give the audio subsystem a moment to enumerate the new endpoint.
+        Sleep(3000);
+        set_microphone_format();
+        return true;
+      }
+
+      auto err = GetLastError();
+      switch (err) {
+        case ERROR_ACCESS_DENIED:
+          BOOST_LOG(warning) << "Administrator privileges are required to install Steam Streaming Microphone"sv;
+          break;
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+          BOOST_LOG(warning) << "Steam Streaming Microphone driver files not found"sv;
+          break;
+        default:
+          BOOST_LOG(warning) << "Failed to install Steam Streaming Microphone driver: "sv << err;
+          break;
+      }
+
+      return false;
+#else
+      BOOST_LOG(warning) << "Unable to install Steam Streaming Microphone on unknown architecture"sv;
+      return false;
+#endif
+    }
+
+    /**
      * @brief Initialize Windows audio policy interfaces.
      *
      * @return 0 on success; nonzero or negative platform status on failure.
@@ -1360,6 +1733,8 @@ namespace platf::audio {
     policy_t policy;  ///< Windows policy configuration interface used to switch default audio devices.
     audio::device_enum_t device_enum;  ///< Device enumerator used to query and watch audio endpoints.
     std::string assigned_sink;  ///< Virtual sink assigned while Sunshine captures host audio.
+    std::wstring assigned_mic;  ///< Default capture device saved before Sunshine switched to the Steam microphone.
+    bool mic_default_assigned = false;  ///< Whether Sunshine switched the default microphone this session.
   };
 }  // namespace platf::audio
 
@@ -1389,6 +1764,13 @@ namespace platf {
       control->install_steam_audio_drivers();
     }
 
+    // Install the Steam Streaming Microphone driver if needed. This provides the
+    // virtual recording device used by client-to-host microphone passthrough.
+    // Best effort and idempotent (skipped when the device is already present).
+    if (config::audio.install_steam_drivers) {
+      control->install_steam_microphone_driver();
+    }
+
     return control;
   }
 
@@ -1403,8 +1785,15 @@ namespace platf {
     // If Steam Streaming Speakers are currently the default audio device,
     // change the default to something else (if another device is available).
     audio::audio_control_t audio_ctrl;
+
+    // Provision the bundled Steam Streaming Microphone driver at startup
+    // (best effort, skipped when already present) so no manual setup or stream
+    // is required for the device to be ready.
+    audio_ctrl.install_steam_microphone_driver();
+
     if (audio_ctrl.init() == 0) {
       audio_ctrl.reset_default_device();
+      audio_ctrl.reset_default_microphone();
     }
 
     return co_init;

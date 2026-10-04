@@ -1850,6 +1850,9 @@ namespace platf {
       BOOST_LOG(warning) << "Touch input requires Windows 10 1809 or later"sv;
     }
 
+    // Host can receive client microphone audio (client-to-host mic passthrough).
+    caps |= platform_caps::mic_input;
+
     return caps;
   }
 }  // namespace platf

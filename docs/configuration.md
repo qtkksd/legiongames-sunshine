@@ -856,7 +856,9 @@ editing the `conf` file in a text editor. Use the examples as reference.
         <td>Description</td>
         <td colspan="2">
             Installs the Steam Streaming Speakers driver (if Steam is installed) to support surround sound and muting
-            host audio.
+            host audio, and the Steam Streaming Microphone driver used by client-to-host microphone passthrough.
+            The microphone driver is bundled with Sunshine, so it can be installed even when Steam is not present.
+            Installation is skipped for a device that is already present.
             @note{This option is only supported on Windows.}
         </td>
     </tr>
