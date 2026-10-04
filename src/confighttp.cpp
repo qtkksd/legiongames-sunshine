@@ -1631,6 +1631,8 @@ namespace confighttp {
   // Device registry property ids for CM_Get_DevNode_Registry_Property.
   constexpr ULONG drp_compatible_ids = 0x00000003;
   constexpr ULONG drp_service = 0x00000005;
+  constexpr ULONG drp_config_flags = 0x0000000B;
+  constexpr ULONG drp_friendly_name = 0x0000000D;
 
   // Device problem codes / flags for the eject-remove block (fallbacks if the SDK omits them).
 #ifndef CM_PROB_WILL_BE_REMOVED
@@ -1884,6 +1886,108 @@ namespace confighttp {
     return physical ? chain : std::vector<DEVINST> {};
   }
 
+  /** @brief Problem codes that indicate a device is blocked by our input-block. */
+  bool is_block_problem(ULONG problem) {
+    return problem == CM_PROB_DISABLED || problem == CM_PROB_WILL_BE_REMOVED || problem == CM_PROB_HELD_FOR_EJECT;
+  }
+
+  /** @brief A USB/HID device node with its state, for status and healing. */
+  struct device_info_t {
+    DEVINST devinst = 0;
+    std::string instance_id;
+    std::string name;
+    std::string service;
+    std::string parent_id;
+    ULONG problem = 0;        ///< CM problem code (0 = none).
+    ULONG status = 0;         ///< CM status flags.
+    DWORD config_flags = 0;   ///< Device ConfigFlags (CONFIGFLAG_DISABLED = 1).
+    int depth = 0;            ///< Distance from the root (for top-down healing).
+    bool root_hub = false;    ///< True for USB root hubs (never re-enumerated/cycled).
+  };
+
+  /**
+   * @brief Enumerate all present USB and HID device nodes (including hidden ones).
+   * @details Uses the device ID list for the USB and HID enumerators rather than the
+   *          class scan, so devices hidden behind a disabled parent are still found.
+   */
+  std::vector<device_info_t> enumerate_usb_hid_devices() {
+    std::vector<device_info_t> result;
+
+    for (const wchar_t *enumerator : {L"USB", L"HID"}) {
+      ULONG len = 0;
+      if (CM_Get_Device_ID_List_SizeW(&len, enumerator, CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT) != CR_SUCCESS || len == 0) {
+        continue;
+      }
+      std::vector<wchar_t> buffer(len, L'\0');
+      if (CM_Get_Device_ID_ListW(enumerator, buffer.data(), len, CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT) != CR_SUCCESS) {
+        continue;
+      }
+
+      for (const wchar_t *cursor = buffer.data(); *cursor;) {
+        const std::wstring entry(cursor);
+        cursor += entry.size() + 1;
+
+        DEVINST devinst = 0;
+        if (CM_Locate_DevNodeW(&devinst, const_cast<wchar_t *>(entry.c_str()), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS) {
+          continue;
+        }
+
+        device_info_t info;
+        info.devinst = devinst;
+        info.instance_id = wide_to_utf8(entry.c_str());
+        info.root_hub = info.instance_id.rfind("USB\\ROOT_HUB", 0) == 0;
+
+        ULONG status = 0;
+        ULONG problem = 0;
+        if (CM_Get_DevNode_Status(&status, &problem, devinst, 0) == CR_SUCCESS) {
+          info.status = status;
+          info.problem = (status & DN_HAS_PROBLEM) ? problem : 0;
+        }
+
+        info.name = device_string_property(devinst, drp_friendly_name);
+        if (info.name.empty()) {
+          info.name = info.instance_id;
+        }
+        info.service = device_string_property(devinst, drp_service);
+        info.parent_id = parent_instance_id(devinst);
+
+        ULONG flags = 0;
+        ULONG flags_size = sizeof(flags);
+        if (CM_Get_DevNode_Registry_PropertyW(devinst, drp_config_flags, nullptr, reinterpret_cast<PBYTE>(&flags), &flags_size, 0) == CR_SUCCESS) {
+          info.config_flags = flags;
+        }
+
+        for (DEVINST node = devinst; info.depth < 16;) {
+          DEVINST parent = 0;
+          if (CM_Get_Parent(&parent, node, 0) != CR_SUCCESS || parent == 0) {
+            break;
+          }
+          info.depth++;
+          node = parent;
+        }
+
+        result.push_back(std::move(info));
+      }
+    }
+
+    return result;
+  }
+
+  /** @brief Serialize a device node to JSON for status/reports. */
+  nlohmann::json device_info_to_json(const device_info_t &device) {
+    return {
+      {"instance_id", device.instance_id},
+      {"name", device.name},
+      {"service", device.service},
+      {"parent", device.parent_id},
+      {"problem", device.problem},
+      {"config_flags", device.config_flags},
+      {"disabled_flag", (device.config_flags & 1) != 0},
+      {"depth", device.depth},
+      {"root_hub", device.root_hub}
+    };
+  }
+
   /**
    * @brief Enumerate present, disabled HID/USB input nodes (bus parents/HID devices).
    * @details Used by unblock/self-heal because a disabled parent hides its child
@@ -2095,37 +2199,6 @@ namespace confighttp {
   }
 
   /**
-   * @brief Force-disable a node by setting CONFIGFLAG_DISABLED and re-enumerating.
-   * @details Last resort for nodes that refuse CM_Disable_DevNode (CR_NOT_DISABLEABLE).
-   */
-  bool registry_disable(DEVINST devinst) {
-    HKEY key = nullptr;
-    if (CM_Open_DevNode_Key(devinst, KEY_QUERY_VALUE | KEY_SET_VALUE, 0, RegDisposition_OpenExisting, &key, CM_REGISTRY_HARDWARE) != CR_SUCCESS) {
-      BOOST_LOG(debug) << "Input block: CM_Open_DevNode_Key failed for "sv << device_instance_id(devinst);
-      return false;
-    }
-
-    DWORD flags = 0;
-    DWORD size = sizeof(flags);
-    DWORD type = 0;
-    RegQueryValueExW(key, L"ConfigFlags", nullptr, &type, reinterpret_cast<LPBYTE>(&flags), &size);
-    const DWORD before = flags;
-    flags |= 0x00000001;  // CONFIGFLAG_DISABLED
-
-    const bool ok = RegSetValueExW(key, L"ConfigFlags", 0, REG_DWORD, reinterpret_cast<const BYTE *>(&flags), sizeof(flags)) == ERROR_SUCCESS;
-    RegCloseKey(key);
-
-    if (input_block_verbose.load()) {
-      BOOST_LOG(info) << "Input block: ConfigFlags "sv << before << " -> "sv << flags << " ok="sv << ok << " for "sv << device_instance_id(devinst);
-    }
-
-    if (ok) {
-      reenumerate_node(devinst);
-    }
-    return ok;
-  }
-
-  /**
    * @brief Clear a forced registry disable (CONFIGFLAG_DISABLED) and re-enumerate.
    */
   bool registry_enable(DEVINST devinst) {
@@ -2215,16 +2288,86 @@ namespace confighttp {
   }
 
   /**
-   * @brief Poll until a node reports blocked (registry re-enumeration is async).
+   * @brief Heal a single blocked node (caller orders top-down).
+   * @details Dispatches by problem code. Root hubs are only enabled, never
+   *          re-enumerated or port-cycled.
+   * @return A short action string.
    */
-  bool wait_blocked(DEVINST devinst, int tries = 10) {
-    for (int i = 0; i < tries; ++i) {
-      if (node_is_blocked(devinst)) {
-        return true;
+  std::string heal_one_device(const device_info_t &device) {
+    if (device.root_hub) {
+      if (device.problem == CM_PROB_DISABLED) {
+        registry_enable(device.devinst);
+        CM_Enable_DevNode(device.devinst, 0);
+        return "enabled_root_hub";
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      return "skipped_root_hub";
     }
-    return node_is_blocked(devinst);
+
+    switch (device.problem) {
+      case CM_PROB_DISABLED:
+        registry_enable(device.devinst);
+        CM_Enable_DevNode(device.devinst, 0);
+        reenumerate_node(device.devinst);
+        return "enabled";
+      case CM_PROB_WILL_BE_REMOVED:
+        reenumerate_node(device.devinst);
+        return "reenumerated";
+      case CM_PROB_HELD_FOR_EJECT:
+        usb_cycle_port(device.devinst);
+        reenumerate_node(device.devinst);
+        return "cycled_port";
+      default:
+        return "noop";
+    }
+  }
+
+  /**
+   * @brief Cascade-heal every blocked USB/HID device.
+   * @details Re-scans after each pass because enabling a parent reveals disabled
+   *          children. Runs at most @p max_passes times. Only ever enables devices.
+   * @return A JSON report of each pass.
+   */
+  nlohmann::json heal_input_devices(int max_passes = 15) {
+    nlohmann::json report = nlohmann::json::array();
+
+    for (int pass = 1; pass <= max_passes; ++pass) {
+      std::vector<device_info_t> blocked;
+      for (const auto &device : enumerate_usb_hid_devices()) {
+        if (is_block_problem(device.problem)) {
+          blocked.push_back(device);
+        }
+      }
+
+      nlohmann::json pass_report;
+      pass_report["pass"] = pass;
+      pass_report["blocked"] = blocked.size();
+
+      if (blocked.empty()) {
+        pass_report["clean"] = true;
+        report.push_back(std::move(pass_report));
+        break;
+      }
+
+      // Top-down: enable ancestors before descendants so hidden children appear next pass.
+      std::sort(blocked.begin(), blocked.end(), [](const device_info_t &a, const device_info_t &b) {
+        return a.depth < b.depth;
+      });
+
+      nlohmann::json acted = nlohmann::json::array();
+      for (const auto &device : blocked) {
+        const std::string action = heal_one_device(device);
+        acted.push_back({{"instance_id", device.instance_id}, {"problem", device.problem}, {"action", action}});
+        if (input_block_verbose.load()) {
+          BOOST_LOG(info) << "Input heal: "sv << action << " "sv << device.instance_id << " (problem "sv << device.problem << ")"sv;
+        }
+      }
+      pass_report["acted"] = std::move(acted);
+      report.push_back(std::move(pass_report));
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    }
+
+    return report;
   }
 
   /** @brief Registry location recording blocked target instance ids. */
@@ -2360,47 +2503,21 @@ namespace confighttp {
   }
 
   /**
-   * @brief Block a device node.
-   * @details Primary method is eject/remove (a different API family than disable):
-   *          CM_Query_And_Remove_SubTree (problem code 21) then CM_Request_Device_Eject
-   *          (problem code 47). These work on nodes that report CR_NOT_DISABLEABLE.
-   *          Falls back to the legacy disable paths (CM_Disable_DevNode, Device
-   *          Manager DICS_DISABLE, forced CONFIGFLAG_DISABLED).
-   * @return `disabled`, `removed`, `ejected`, `already_blocked`, or `error_<code>`.
+   * @brief Block a device node by ejecting/removing it.
+   * @details Eject/remove ONLY: CM_Query_And_Remove_SubTree (problem code 21) then
+   *          CM_Request_Device_Eject (problem code 47). We deliberately do NOT fall
+   *          back to CM_Disable_DevNode / DICS_DISABLE / registry_disable: those
+   *          write CONFIGFLAG_DISABLED, which is reboot-persistent and can be baked
+   *          into a state snapshot (the 1.1.8 lockout). Eject/remove is cleared by a
+   *          reboot and never touches the registry.
+   * @return `removed`, `ejected`, `already_blocked`, or `error_<code>`.
    */
   std::string disable_node(DEVINST devinst, const std::string &name) {
     if (node_is_blocked(devinst)) {
       return "already_blocked";
     }
 
-    // Eject/remove first — the disable APIs return CR_NOT_DISABLEABLE on these nodes.
-    const std::string eject = eject_node(devinst, name);
-    if (eject == "removed" || eject == "ejected") {
-      return eject;
-    }
-
-    CONFIGRET cr = CM_Disable_DevNode(devinst, CM_DISABLE_UI_NOT_OK);
-    if (cr == CR_NOT_DISABLEABLE) {
-      cr = CM_Disable_DevNode(devinst, CM_DISABLE_ABSOLUTE | CM_DISABLE_UI_NOT_OK);
-    }
-    if (cr == CR_SUCCESS || node_is_disabled(devinst)) {
-      return "disabled";
-    }
-
-    if (setupdi_set_state(devinst, DICS_DISABLE) && node_is_disabled(devinst)) {
-      return "disabled";
-    }
-
-    if (registry_disable(devinst) && wait_blocked(devinst)) {
-      return "disabled";
-    }
-
-    if (input_block_verbose.load()) {
-      BOOST_LOG(warning) << "Input block: could not block ["sv << static_cast<unsigned long>(cr) << "] "sv << name;
-    } else {
-      BOOST_LOG(debug) << "Input block: could not block ["sv << static_cast<unsigned long>(cr) << "] "sv << name;
-    }
-    return std::format("error_{}", static_cast<unsigned long>(cr));
+    return eject_node(devinst, name);
   }
 
   /**
@@ -2513,9 +2630,19 @@ namespace confighttp {
         results.push_back(std::move(entry));
       }
 
-      // Restore nodes that were blocked and recorded — the class scans above can
-      // miss them (e.g. a USB interface node whose class is HIDClass, or a node
-      // removed/ejected from the bus).
+      // Full cascade heal over ALL USB/HID nodes — catches hidden/unrecorded devices
+      // and the "enabling a parent reveals more disabled children" wave.
+      if (!dry_run) {
+        nlohmann::json entry;
+        entry["name"] = "cascade-heal";
+        entry["instance_id"] = "cascade-heal";
+        entry["result"] = "enabled";
+        entry["passes"] = heal_input_devices(15);
+        results.push_back(std::move(entry));
+      }
+
+      // Restore recorded targets; KEEP any that failed so the next boot retries.
+      std::vector<blocked_target_t> remaining;
       for (const auto &target : read_blocked_targets()) {
         nlohmann::json entry;
         entry["name"] = target.instance_id;
@@ -2524,13 +2651,17 @@ namespace confighttp {
         if (dry_run) {
           entry["result"] = "would_enable";
         } else {
-          entry["result"] = restore_target(target) ? "enabled" : "error_enable";
+          const bool ok = restore_target(target);
+          entry["result"] = ok ? "enabled" : "error_enable";
+          if (!ok) {
+            remaining.push_back(target);
+          }
         }
         results.push_back(std::move(entry));
       }
 
       if (!dry_run) {
-        write_blocked_targets({});
+        write_blocked_targets(remaining);
       }
     }
 
@@ -2638,9 +2769,19 @@ namespace confighttp {
    * @brief Re-enable any physical input disabled by a previous session (startup self-heal).
    */
   void self_heal_input_state() {
-    std::lock_guard<std::mutex> lock(input_block_mutex);
-    apply_input_state(true, false);
-    BOOST_LOG(info) << "Input block: startup self-heal restored physical input"sv;
+    // Run on a background thread so a slow/blocked device tree can never stop
+    // Sunshine from starting. Give the device tree (and any state-revert) time to
+    // settle before healing.
+    std::thread([]() {
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+      {
+        std::lock_guard<std::mutex> lock(input_block_mutex);
+        input_block_verbose.store(true);
+        apply_input_state(true, false);
+        input_block_verbose.store(false);
+      }
+      BOOST_LOG(info) << "Input block: startup self-heal complete"sv;
+    }).detach();
   }
 
   /**
@@ -2678,7 +2819,9 @@ namespace confighttp {
     auto keyboards = enumerate_input_class(class_guid_keyboard);
     auto mice = enumerate_input_class(class_guid_mouse);
     auto monitors = enumerate_input_class(class_guid_monitor);
+    auto all_devices = enumerate_usb_hid_devices();
 
+    // Visible (class-based) disabled state.
     bool blocked = false;
     for (const auto &device : keyboards) {
       blocked = blocked || device.disabled;
@@ -2687,9 +2830,41 @@ namespace confighttp {
       blocked = blocked || device.disabled;
     }
 
+    // Authoritative blocked state: any USB/HID node with a block problem code,
+    // including devices hidden behind a disabled parent (the class scan can't see them).
+    std::vector<std::string> visible_ids;
+    for (const auto &device : keyboards) {
+      visible_ids.push_back(device.instance_id);
+    }
+    for (const auto &device : mice) {
+      visible_ids.push_back(device.instance_id);
+    }
+
+    nlohmann::json blocked_nodes = nlohmann::json::array();
+    nlohmann::json hidden_blocked = nlohmann::json::array();
+    nlohmann::json devices_json = nlohmann::json::array();
+    for (const auto &device : all_devices) {
+      devices_json.push_back(device_info_to_json(device));
+      if (is_block_problem(device.problem)) {
+        blocked = true;
+        blocked_nodes.push_back(device_info_to_json(device));
+        if (std::find(visible_ids.begin(), visible_ids.end(), device.instance_id) == visible_ids.end()) {
+          hidden_blocked.push_back(device_info_to_json(device));
+        }
+      }
+    }
+
+    nlohmann::json recorded = nlohmann::json::array();
+    for (const auto &target : read_blocked_targets()) {
+      recorded.push_back({{"instance_id", target.instance_id}, {"method", target.method}, {"parent", target.parent_id}});
+    }
+
     output_tree["configured"] = true;
     output_tree["method"] = "native";
+    output_tree["enabled"] = config::input.input_block_enabled;
     output_tree["blocked"] = blocked;
+    output_tree["blocked_count"] = blocked_nodes.size();
+    output_tree["hidden_blocked_count"] = hidden_blocked.size();
     output_tree["monitor_off"] = monitor_off_active.load();
     output_tree["keyboard"] = devices_to_json(keyboards);
     output_tree["mouse"] = devices_to_json(mice);
@@ -2697,6 +2872,10 @@ namespace confighttp {
     output_tree["keyboard_count"] = keyboards.size();
     output_tree["mouse_count"] = mice.size();
     output_tree["monitor_count"] = monitors.size();
+    output_tree["blocked_nodes"] = blocked_nodes;
+    output_tree["hidden_blocked"] = hidden_blocked;
+    output_tree["devices"] = devices_json;
+    output_tree["recorded_targets"] = recorded;
 #else
     output_tree["configured"] = false;
     output_tree["error"] = "Input blocking is only available on Windows";
@@ -2727,6 +2906,13 @@ namespace confighttp {
     nlohmann::json output_tree;
 
 #ifdef _WIN32
+    if (!config::input.input_block_enabled) {
+      output_tree["status"] = false;
+      output_tree["error"] = "Input block is disabled by configuration (set input_block_enabled=true)";
+      send_response(response, output_tree);
+      return;
+    }
+
     const bool dry_run = request_dry_run(request);
 
     nlohmann::json results;
@@ -2829,6 +3015,51 @@ namespace confighttp {
 #else
     output_tree["status"] = false;
     output_tree["error"] = "Input blocking is only available on Windows";
+#endif
+
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Force a full cascade heal of all blocked USB/HID devices.
+   * @details One-shot recovery that heals any device with problem 22/21/47 by full
+   *          enumeration (present + hidden), independent of recorded targets.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/input-block/recover| POST| null}
+   */
+  void recoverInput(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree;
+
+#ifdef _WIN32
+    stop_input_block_watchdog();
+    input_block_verbose.store(true);
+    nlohmann::json passes;
+    {
+      std::lock_guard<std::mutex> lock(input_block_mutex);
+      passes = heal_input_devices(15);
+    }
+    input_block_verbose.store(false);
+
+    output_tree["status"] = true;
+    output_tree["passes"] = passes;
+
+    BOOST_LOG(info) << "Input recover: cascade heal complete ("sv << passes.size() << " passes)"sv;
+#else
+    output_tree["status"] = false;
+    output_tree["error"] = "Input recovery is only available on Windows";
 #endif
 
     send_response(response, output_tree);
@@ -3964,6 +4195,7 @@ namespace confighttp {
     server.resource["^/api/input-block/status$"]["GET"] = getInputBlockStatus;
     server.resource["^/api/input-block/block$"]["POST"] = blockInput;
     server.resource["^/api/input-block/unblock$"]["POST"] = unblockInput;
+    server.resource["^/api/input-block/recover$"]["POST"] = recoverInput;
     server.resource["^/api/input-block/monitor/off$"]["POST"] = monitorOff;
     server.resource["^/api/input-block/monitor/on$"]["POST"] = monitorOn;
     server.resource["^/api/health$"]["GET"] = getHealth;
