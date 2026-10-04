@@ -1623,7 +1623,7 @@ namespace stream {
           } else {
             const UINT32 available = (ep.buffer_frame_count > padding) ? (ep.buffer_frame_count - padding) : 0;
             if (available < static_cast<UINT32>(decodedSamples)) {
-              BOOST_LOG(debug) << "Mic render: dropping frame (buffer full, padding="sv << padding << ')'sv;
+              BOOST_LOG(debug) << "Mic render: dropping frame (buffer full, padding="sv << padding << ')';
             } else {
               space_ok = true;
             }
