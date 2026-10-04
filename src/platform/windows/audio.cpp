@@ -1609,6 +1609,11 @@ namespace platf::audio {
      * that otherwise cause pitch shifts or noise. Best effort.
      */
     void set_microphone_format() {
+      // Requires init() to have created the COM enumerator/policy objects.
+      if (!device_enum || !policy) {
+        return;
+      }
+
       auto matched = find_device_id(match_steam_microphone());
       if (!matched) {
         return;
@@ -1786,12 +1791,12 @@ namespace platf {
     // change the default to something else (if another device is available).
     audio::audio_control_t audio_ctrl;
 
-    // Provision the bundled Steam Streaming Microphone driver at startup
-    // (best effort, skipped when already present) so no manual setup or stream
-    // is required for the device to be ready.
-    audio_ctrl.install_steam_microphone_driver();
-
     if (audio_ctrl.init() == 0) {
+      // Provision the bundled Steam Streaming Microphone driver at startup
+      // (best effort, skipped when already present) so no manual setup or
+      // stream is required. This MUST run after init(): it uses device_enum
+      // and policy, which init() creates.
+      audio_ctrl.install_steam_microphone_driver();
       audio_ctrl.reset_default_device();
       audio_ctrl.reset_default_microphone();
     }
