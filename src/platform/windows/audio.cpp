@@ -1601,12 +1601,36 @@ namespace platf::audio {
      *
      * @return `true` if the device is installed (already present or newly installed).
      */
+    /**
+     * @brief Force the Steam Streaming Microphone endpoint to 48 kHz / 2 ch / 32-bit float.
+     *
+     * The client-to-host mic wire format is 48 kHz mono s16. Pinning the endpoint
+     * to a 48 kHz float stereo format avoids sample-rate/bit-depth mismatches
+     * that otherwise cause pitch shifts or noise. Best effort.
+     */
+    void set_microphone_format() {
+      auto matched = find_device_id(match_steam_microphone());
+      if (!matched) {
+        return;
+      }
+
+      auto waveformat = create_waveformat(sample_format_e::f32, 2, waveformat_mask_stereo);
+      WAVEFORMATEXTENSIBLE closest {};
+      auto hr = policy->SetDeviceFormat(matched->second.c_str(), (WAVEFORMATEX *) &waveformat, (WAVEFORMATEX *) &closest);
+      if (FAILED(hr)) {
+        BOOST_LOG(warning) << "Couldn't set Steam Streaming Microphone format: 0x"sv << util::hex(hr).to_string_view();
+      } else {
+        BOOST_LOG(info) << "Set Steam Streaming Microphone format to 48 kHz / 2 ch / 32-bit float"sv;
+      }
+    }
+
     bool install_steam_microphone_driver() {
 #ifdef STEAM_DRIVER_SUBDIR
       // Do not install if the device is already registered, even if it is
       // currently disabled or unplugged.
       if (pnp_device_installed(L"ROOT\\SteamStreamingMicrophone")) {
         BOOST_LOG(debug) << "Steam Streaming Microphone driver already installed"sv;
+        set_microphone_format();
         return true;
       }
 
@@ -1639,6 +1663,7 @@ namespace platf::audio {
 
         // Give the audio subsystem a moment to enumerate the new endpoint.
         Sleep(3000);
+        set_microphone_format();
         return true;
       }
 
