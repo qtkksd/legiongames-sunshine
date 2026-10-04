@@ -382,6 +382,10 @@ namespace platf {
      * @brief Capability bit indicating controller touchpad support.
      */
     constexpr caps_t controller_touch = 0x02;  // Controller touch events
+    /**
+     * @brief Capability bit indicating the host can receive client microphone audio.
+     */
+    constexpr caps_t mic_input = 0x0100;  // Client-to-host mic input (SS_FF_MIC_INPUT)
   };  // namespace platform_caps
 
   /**

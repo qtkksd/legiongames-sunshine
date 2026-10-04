@@ -13,9 +13,25 @@
 #include <openssl/err.h>
 #include <rs.h>
 
+#ifdef _WIN32
+  // WASAPI for the host-side mic render path. Do NOT define INITGUID here: the
+  // GUID symbols (IID_IMMDeviceEnumerator, CLSID_MMDeviceEnumerator, ...) are
+  // emitted by src/platform/windows/audio.cpp, which does define INITGUID.
+  // winsock2.h must precede windows.h-pulling headers.
+  #include <winsock2.h>
+  #include <Audioclient.h>
+  #include <mmdeviceapi.h>
+  #include <propkey.h>
+  #include <propsys.h>
+  #include <cstring>
+  #include <cwchar>
+  #include <cwctype>
+#endif
+
 extern "C" {
   // clang-format off
 #include <moonlight-common-c/src/Limelight-internal.h>
+#include <opus/opus.h>
   // clang-format on
 }
 
@@ -25,6 +41,7 @@ extern "C" {
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
+#include "mic_parser.h"
 #include "network.h"
 #include "platform/common.h"
 #include "process.h"
@@ -49,6 +66,7 @@ constexpr int IDX_RUMBLE_TRIGGER_DATA = 12;  ///< Control-stream message index f
 constexpr int IDX_SET_MOTION_EVENT = 13;  ///< Control-stream message index for set motion event.
 constexpr int IDX_SET_RGB_LED = 14;  ///< Control-stream message index for set rgb led.
 constexpr int IDX_SET_ADAPTIVE_TRIGGERS = 15;  ///< Control-stream message index for set adaptive triggers.
+constexpr int IDX_MIC_OPUS_DATA = 16;  ///< Control-stream message index for client-to-host microphone Opus frames.
 
 static const short packetTypes[] = {
   0x0305,  // Start A
@@ -67,7 +85,18 @@ static const short packetTypes[] = {
   0x5501,  // Set motion event (Sunshine protocol extension)
   0x5502,  // Set RGB LED (Sunshine protocol extension)
   0x5503,  // Set Adaptive triggers (Sunshine protocol extension)
+  0x5510,  // Client-to-host microphone Opus frame (moonlight-mic extension)
 };
+
+// Client-to-host microphone (moonlight-mic extension). MUST stay in sync with
+// moonlight-common-c/src/Mic.h.
+static constexpr std::uint16_t SS_MIC_OPUS_PTYPE = 0x5510;  // control-stream packet type
+static constexpr std::uint32_t SS_FF_MIC_INPUT = 0x0100;  // host advertises in x-ss-general.featureFlags
+static constexpr std::uint32_t ML_FF_MIC_INPUT = 0x04;  // client advertises in x-ml-general.featureFlags
+
+static_assert(SS_MIC_OPUS_PTYPE == 0x5510, "SS_MIC_OPUS_PTYPE mismatch");
+static_assert(SS_FF_MIC_INPUT == platf::platform_caps::mic_input, "SS_FF_MIC_INPUT must match platform_caps::mic_input");
+
 
 namespace asio = boost::asio;
 namespace sys = boost::system;
@@ -468,6 +497,327 @@ namespace stream {
   };
 
   /**
+   * @brief RAII wrapper around an OpusDecoder for the client-to-host microphone stream.
+   *
+   * One per session; allocated in session::alloc() and released when the
+   * session is destroyed.
+   */
+  using opus_decoder_t = util::safe_ptr<OpusDecoder, opus_decoder_destroy>;
+
+#ifdef _WIN32
+  // WASAPI plumbing to write decoded mic PCM into the "Steam Streaming
+  // Microphone" virtual render endpoint. Kept in stream.cpp so it does not
+  // widen the surface of the host-to-client audio path.
+  template<class T>
+  static void mic_com_release(T *p) {
+    p->Release();
+  }
+
+  using imm_device_enum_t = util::safe_ptr<IMMDeviceEnumerator, mic_com_release<IMMDeviceEnumerator>>;
+  using imm_device_t = util::safe_ptr<IMMDevice, mic_com_release<IMMDevice>>;
+  using imm_collection_t = util::safe_ptr<IMMDeviceCollection, mic_com_release<IMMDeviceCollection>>;
+  using imm_property_store_t = util::safe_ptr<IPropertyStore, mic_com_release<IPropertyStore>>;
+  using imm_audio_client_t = util::safe_ptr<IAudioClient, mic_com_release<IAudioClient>>;
+  using imm_render_client_t = util::safe_ptr<IAudioRenderClient, mic_com_release<IAudioRenderClient>>;
+
+  /**
+   * @brief PCM sample-format flavour handled on the render endpoint.
+   */
+  enum class mic_sample_kind {
+    unsupported,  ///< No explicit conversion path.
+    int16,  ///< 16-bit signed little-endian PCM.
+    float32,  ///< 32-bit IEEE-754 little-endian float.
+  };
+
+  /**
+   * @brief Per-session WASAPI render endpoint for the Steam Streaming Microphone.
+   *
+   * Null-tolerant: a missing Steam driver yields a nullptr endpoint, and the
+   * decoded PCM is discarded.
+   */
+  struct mic_endpoint_t {
+    imm_audio_client_t audio_client;
+    imm_render_client_t render_client;
+    UINT32 buffer_frame_count = 0;
+
+    DWORD sample_rate = 0;
+    WORD channels = 0;
+    WORD bits_per_sample = 0;
+    mic_sample_kind sample_kind = mic_sample_kind::unsupported;
+
+    ~mic_endpoint_t() {
+      if (audio_client) {
+        audio_client->Stop();
+      }
+      // safe_ptr destructors call Release() on audio_client and render_client.
+    }
+  };
+
+  // PKEY_Device_FriendlyName inline — avoids a second INITGUID definition.
+  static const PROPERTYKEY mic_pkey_device_friendly_name = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}},
+    14
+  };
+
+  // KSDATAFORMAT subtypes inline, same reason as above.
+  static const GUID mic_ksdataformat_subtype_pcm = {
+    0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}
+  };
+  static const GUID mic_ksdataformat_subtype_ieee_float = {
+    0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}
+  };
+
+  /**
+   * @brief Classify a WAVEFORMATEX into one of the supported conversion paths.
+   */
+  static mic_sample_kind detect_mic_sample_kind(const WAVEFORMATEX *wfx) {
+    if (!wfx) {
+      return mic_sample_kind::unsupported;
+    }
+    if (wfx->wFormatTag == WAVE_FORMAT_PCM && wfx->wBitsPerSample == 16) {
+      return mic_sample_kind::int16;
+    }
+    if (wfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT && wfx->wBitsPerSample == 32) {
+      return mic_sample_kind::float32;
+    }
+    if (wfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+        wfx->cbSize >= (sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))) {
+      auto wfxe = reinterpret_cast<const WAVEFORMATEXTENSIBLE *>(wfx);
+      if (IsEqualGUID(wfxe->SubFormat, mic_ksdataformat_subtype_ieee_float) &&
+          wfx->wBitsPerSample == 32) {
+        return mic_sample_kind::float32;
+      }
+      if (IsEqualGUID(wfxe->SubFormat, mic_ksdataformat_subtype_pcm) &&
+          wfx->wBitsPerSample == 16) {
+        return mic_sample_kind::int16;
+      }
+    }
+    return mic_sample_kind::unsupported;
+  }
+
+  /**
+   * @brief Case-insensitive wide-string substring match.
+   */
+  static bool wstr_contains_icase(const wchar_t *haystack, const wchar_t *needle) {
+    if (!haystack || !needle) {
+      return false;
+    }
+    const std::size_t hlen = std::wcslen(haystack);
+    const std::size_t nlen = std::wcslen(needle);
+    if (nlen == 0 || hlen < nlen) {
+      return false;
+    }
+    for (std::size_t i = 0; i + nlen <= hlen; ++i) {
+      bool match = true;
+      for (std::size_t j = 0; j < nlen; ++j) {
+        if (std::towlower(haystack[i + j]) != std::towlower(needle[j])) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * @brief Enumerate render endpoints and open the Steam Streaming Microphone one.
+   *
+   * @return Endpoint, or nullptr on failure (logged). The caller tolerates null
+   *         and continues, discarding decoded PCM.
+   */
+  static std::unique_ptr<mic_endpoint_t> open_steam_mic_endpoint() {
+    // Ensure COM is initialized on this thread (the control thread may not be).
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED | COINIT_SPEED_OVER_MEMORY);
+
+    // 200 ms buffer in REFERENCE_TIME units (100 ns each). Shorter buffers
+    // underrun between the 20 ms mic packets.
+    constexpr REFERENCE_TIME MIC_BUFFER_DURATION = 2000000;
+
+    imm_device_enum_t device_enum;
+    {
+      IMMDeviceEnumerator *raw = nullptr;
+      HRESULT hr = CoCreateInstance(
+        CLSID_MMDeviceEnumerator,
+        nullptr,
+        CLSCTX_ALL,
+        IID_IMMDeviceEnumerator,
+        reinterpret_cast<void **>(&raw)
+      );
+      if (FAILED(hr) || !raw) {
+        BOOST_LOG(warning) << "Mic endpoint: CoCreateInstance(MMDeviceEnumerator) failed [0x"sv
+                           << util::hex(hr).to_string_view() << "]; mic packets will be decoded and discarded"sv;
+        return nullptr;
+      }
+      device_enum.reset(raw);
+    }
+
+    imm_collection_t collection;
+    {
+      IMMDeviceCollection *raw = nullptr;
+      HRESULT hr = device_enum->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &raw);
+      if (FAILED(hr) || !raw) {
+        BOOST_LOG(warning) << "Mic endpoint: EnumAudioEndpoints failed [0x"sv
+                           << util::hex(hr).to_string_view() << "]; mic packets will be decoded and discarded"sv;
+        return nullptr;
+      }
+      collection.reset(raw);
+    }
+
+    UINT count = 0;
+    if (FAILED(collection->GetCount(&count))) {
+      BOOST_LOG(warning) << "Mic endpoint: IMMDeviceCollection::GetCount failed; mic packets will be decoded and discarded"sv;
+      return nullptr;
+    }
+
+    imm_device_t device;
+    for (UINT i = 0; i < count; ++i) {
+      IMMDevice *raw_device = nullptr;
+      if (FAILED(collection->Item(i, &raw_device)) || !raw_device) {
+        continue;
+      }
+      imm_device_t candidate;
+      candidate.reset(raw_device);
+
+      IPropertyStore *raw_props = nullptr;
+      if (FAILED(candidate->OpenPropertyStore(STGM_READ, &raw_props)) || !raw_props) {
+        continue;
+      }
+      imm_property_store_t props;
+      props.reset(raw_props);
+
+      PROPVARIANT pv;
+      PropVariantInit(&pv);
+      const HRESULT hr_get = props->GetValue(mic_pkey_device_friendly_name, &pv);
+      if (SUCCEEDED(hr_get) && pv.vt == VT_LPWSTR && pv.pwszVal) {
+        if (wstr_contains_icase(pv.pwszVal, L"Steam Streaming Microphone")) {
+          BOOST_LOG(debug) << "Mic endpoint: matched render endpoint at index "sv << i;
+          device = std::move(candidate);
+          PropVariantClear(&pv);
+          break;
+        }
+      }
+      PropVariantClear(&pv);
+    }
+
+    if (!device) {
+      BOOST_LOG(warning) << "Steam Streaming Microphone endpoint not found among "sv
+                         << count << " active render devices; mic packets will be decoded and discarded"sv;
+      return nullptr;
+    }
+
+    imm_audio_client_t audio_client;
+    {
+      IAudioClient *raw = nullptr;
+      HRESULT hr = device->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, reinterpret_cast<void **>(&raw));
+      if (FAILED(hr) || !raw) {
+        BOOST_LOG(warning) << "Mic endpoint: IMMDevice::Activate(IAudioClient) failed [0x"sv
+                           << util::hex(hr).to_string_view() << ']';
+        return nullptr;
+      }
+      audio_client.reset(raw);
+    }
+
+    WAVEFORMATEX *pMixFormat = nullptr;
+    {
+      HRESULT hr = audio_client->GetMixFormat(&pMixFormat);
+      if (FAILED(hr) || !pMixFormat) {
+        BOOST_LOG(warning) << "Mic endpoint: IAudioClient::GetMixFormat failed [0x"sv
+                           << util::hex(hr).to_string_view() << ']';
+        return nullptr;
+      }
+    }
+
+    const mic_sample_kind kind = detect_mic_sample_kind(pMixFormat);
+    const char *kind_name = (kind == mic_sample_kind::int16) ? "s16" :
+                            (kind == mic_sample_kind::float32) ? "f32" :
+                                                                 "unsupported";
+    BOOST_LOG(debug) << "Mic endpoint: mix format "sv
+                     << pMixFormat->nSamplesPerSec << " Hz, "sv
+                     << pMixFormat->nChannels << " ch, "sv
+                     << pMixFormat->wBitsPerSample << " bits, tag=0x"sv
+                     << util::hex(pMixFormat->wFormatTag).to_string_view()
+                     << " ("sv << kind_name << ')';
+
+    {
+      HRESULT hr = audio_client->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+        MIC_BUFFER_DURATION,
+        0,
+        pMixFormat,
+        nullptr
+      );
+      if (FAILED(hr)) {
+        BOOST_LOG(warning) << "Mic endpoint: IAudioClient::Initialize failed [0x"sv
+                           << util::hex(hr).to_string_view() << ']';
+        CoTaskMemFree(pMixFormat);
+        return nullptr;
+      }
+    }
+
+    const DWORD negotiated_sample_rate = pMixFormat->nSamplesPerSec;
+    const WORD negotiated_channels = pMixFormat->nChannels;
+    const WORD negotiated_bits = pMixFormat->wBitsPerSample;
+    CoTaskMemFree(pMixFormat);
+    pMixFormat = nullptr;
+
+    UINT32 frame_count = 0;
+    if (FAILED(audio_client->GetBufferSize(&frame_count))) {
+      BOOST_LOG(warning) << "Mic endpoint: IAudioClient::GetBufferSize failed"sv;
+      return nullptr;
+    }
+
+    imm_render_client_t render_client;
+    {
+      IAudioRenderClient *raw = nullptr;
+      HRESULT hr = audio_client->GetService(IID_IAudioRenderClient, reinterpret_cast<void **>(&raw));
+      if (FAILED(hr) || !raw) {
+        BOOST_LOG(warning) << "Mic endpoint: IAudioClient::GetService(IAudioRenderClient) failed [0x"sv
+                           << util::hex(hr).to_string_view() << ']';
+        return nullptr;
+      }
+      render_client.reset(raw);
+    }
+
+    {
+      const UINT32 prime_frames = frame_count / 2;
+      BYTE *silence_buf = nullptr;
+      HRESULT hr_prime = render_client->GetBuffer(prime_frames, &silence_buf);
+      if (SUCCEEDED(hr_prime) && silence_buf) {
+        render_client->ReleaseBuffer(prime_frames, AUDCLNT_BUFFERFLAGS_SILENT);
+        BOOST_LOG(debug) << "Mic endpoint: primed "sv << prime_frames << " frames of silence"sv;
+      } else {
+        BOOST_LOG(warning) << "Mic endpoint: priming GetBuffer failed [0x"sv
+                           << util::hex(hr_prime).to_string_view() << "] — continuing without prime"sv;
+      }
+    }
+
+    if (FAILED(audio_client->Start())) {
+      BOOST_LOG(warning) << "Mic endpoint: IAudioClient::Start failed"sv;
+      return nullptr;
+    }
+
+    BOOST_LOG(debug) << "Mic endpoint: opened, buffer="sv << frame_count
+                     << " frames @ "sv << negotiated_sample_rate
+                     << " Hz, "sv << negotiated_channels << " ch, "sv
+                     << negotiated_bits << " bits ("sv << kind_name << ')';
+
+    auto endpoint = std::make_unique<mic_endpoint_t>();
+    endpoint->audio_client = std::move(audio_client);
+    endpoint->render_client = std::move(render_client);
+    endpoint->buffer_frame_count = frame_count;
+    endpoint->sample_rate = negotiated_sample_rate;
+    endpoint->channels = negotiated_channels;
+    endpoint->bits_per_sample = negotiated_bits;
+    endpoint->sample_kind = kind;
+    return endpoint;
+  }
+#endif  // _WIN32
+
+  /**
    * @brief Runtime state for one audio/video streaming session.
    */
   struct session_t {
@@ -533,6 +883,21 @@ namespace stream {
       platf::feedback_queue_t feedback_queue;
       safe::mail_raw_t::event_t<video::hdr_info_t> hdr_queue;
     } control;  ///< Runtime state for the encrypted GameStream control channel.
+
+    struct {
+      bool client_advertised = false;  ///< Client advertised ML_FF_MIC_INPUT.
+      bool warn_once_no_capability = false;  ///< One-shot log for packets from a stock client.
+      bool warn_once_no_platform = false;  ///< One-shot log for a host without mic support.
+
+      opus_decoder_t decoder;  ///< Per-session Opus decoder (48 kHz mono).
+      std::uint16_t lastSeq = 0;  ///< Last sequence number seen.
+      bool seenFirstFrame = false;  ///< Whether any mic frame has been received.
+
+#ifdef _WIN32
+      std::unique_ptr<mic_endpoint_t> endpoint;  ///< WASAPI render endpoint for the Steam mic.
+      bool endpoint_init_attempted = false;  ///< Whether endpoint enumeration was attempted.
+#endif
+    } mic;  ///< Client-to-host microphone passthrough state.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
@@ -1178,6 +1543,138 @@ namespace stream {
       }
 
       input::passthrough(session->input, std::move(plaintext));
+    });
+
+    server->map(packetTypes[IDX_MIC_OPUS_DATA], [](session_t *session, const std::string_view &payload) {
+      // Client-to-host microphone Opus frame (moonlight-mic extension).
+      // Wire format: 8-byte big-endian header + Opus payload (mono / 48 kHz / 20 ms).
+      if (!session->mic.client_advertised) {
+        if (!session->mic.warn_once_no_capability) {
+          session->mic.warn_once_no_capability = true;
+          BOOST_LOG(debug) << "Mic packet ignored: client did not advertise ML_FF_MIC_INPUT"sv;
+        }
+        return;
+      }
+
+      constexpr int MIC_SAMPLES_PER_FRAME = 48000 * 20 / 1000;  // 960
+
+      auto rawSpan = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(payload.data()),
+        payload.size()
+      );
+      auto parseResult = mic::parse_mic_frame(rawSpan);
+      if (std::holds_alternative<mic::parse_error_t>(parseResult)) {
+        BOOST_LOG(warning) << "Mic packet rejected (malformed header), size="sv << payload.size();
+        return;
+      }
+
+      auto &frame = std::get<mic::parsed_frame_t>(parseResult);
+
+      if (!session->mic.decoder) {
+        BOOST_LOG(warning) << "Mic packet dropped: decoder unavailable"sv;
+        return;
+      }
+
+      const auto *opusBytes = reinterpret_cast<const unsigned char *>(frame.opusPayload.data());
+      opus_int16 pcmBuffer[MIC_SAMPLES_PER_FRAME];
+
+      const int decodedSamples = opus_decode(
+        session->mic.decoder.get(),
+        opusBytes,
+        static_cast<opus_int32>(frame.opusFrameLength),
+        pcmBuffer,
+        MIC_SAMPLES_PER_FRAME,
+        0
+      );
+      if (decodedSamples < 0) {
+        BOOST_LOG(warning) << "Mic decode failed: "sv << opus_strerror(decodedSamples);
+        return;
+      }
+
+      session->mic.lastSeq = frame.sequenceNumber;
+      session->mic.seenFirstFrame = true;
+
+#ifdef _WIN32
+      // Lazy endpoint init on the first packet; attempted only once per session.
+      if (!session->mic.endpoint_init_attempted) {
+        session->mic.endpoint_init_attempted = true;
+        session->mic.endpoint = open_steam_mic_endpoint();
+      }
+
+      if (session->mic.endpoint && decodedSamples > 0) {
+        auto &ep = *session->mic.endpoint;
+
+        if (ep.sample_rate != 48000) {
+          BOOST_LOG(warning) << "Mic render: device sample rate "sv << ep.sample_rate
+                             << " Hz != wire 48000 Hz, skipping frame"sv;
+        } else if (ep.sample_kind == mic_sample_kind::unsupported) {
+          BOOST_LOG(warning) << "Mic render: device format unsupported, skipping frame"sv;
+        } else if (ep.channels < 1 || ep.channels > 2) {
+          BOOST_LOG(warning) << "Mic render: channel count "sv << ep.channels
+                             << " not supported (need 1 or 2), skipping frame"sv;
+        } else {
+          // Backpressure: drop rather than overflow the render buffer.
+          UINT32 padding = 0;
+          HRESULT hr_pad = ep.audio_client->GetCurrentPadding(&padding);
+          bool space_ok = false;
+          if (FAILED(hr_pad)) {
+            BOOST_LOG(warning) << "Mic render: GetCurrentPadding failed [0x"sv
+                               << util::hex(hr_pad).to_string_view() << "], dropping frame"sv;
+          } else {
+            const UINT32 available = (ep.buffer_frame_count > padding) ? (ep.buffer_frame_count - padding) : 0;
+            if (available < static_cast<UINT32>(decodedSamples)) {
+              BOOST_LOG(debug) << "Mic render: dropping frame (buffer full, padding="sv << padding << ')'sv;
+            } else {
+              space_ok = true;
+            }
+          }
+
+          if (space_ok) {
+            BYTE *render_buffer = nullptr;
+            HRESULT hr = ep.render_client->GetBuffer(static_cast<UINT32>(decodedSamples), &render_buffer);
+            if (SUCCEEDED(hr) && render_buffer) {
+              // Convert mono s16 (wire format) to the negotiated endpoint format.
+              if (ep.channels == 1 && ep.sample_kind == mic_sample_kind::int16) {
+                std::memcpy(render_buffer, pcmBuffer, static_cast<std::size_t>(decodedSamples) * sizeof(opus_int16));
+              } else if (ep.channels == 2 && ep.sample_kind == mic_sample_kind::int16) {
+                auto *dst = reinterpret_cast<int16_t *>(render_buffer);
+                for (int i = 0; i < decodedSamples; ++i) {
+                  dst[2 * i + 0] = pcmBuffer[i];
+                  dst[2 * i + 1] = pcmBuffer[i];
+                }
+              } else if (ep.channels == 1 && ep.sample_kind == mic_sample_kind::float32) {
+                auto *dst = reinterpret_cast<float *>(render_buffer);
+                for (int i = 0; i < decodedSamples; ++i) {
+                  dst[i] = static_cast<float>(pcmBuffer[i]) / 32768.0f;
+                }
+              } else {
+                // Stereo float (common consumer default): duplicate L=R.
+                auto *dst = reinterpret_cast<float *>(render_buffer);
+                for (int i = 0; i < decodedSamples; ++i) {
+                  const float sample = static_cast<float>(pcmBuffer[i]) / 32768.0f;
+                  dst[2 * i + 0] = sample;
+                  dst[2 * i + 1] = sample;
+                }
+              }
+              ep.render_client->ReleaseBuffer(static_cast<UINT32>(decodedSamples), 0);
+            } else if (hr == AUDCLNT_E_BUFFER_TOO_LARGE) {
+              BOOST_LOG(debug) << "Mic render: GetBuffer AUDCLNT_E_BUFFER_TOO_LARGE, dropping frame"sv;
+            } else if (FAILED(hr)) {
+              BOOST_LOG(warning) << "Mic render: GetBuffer failed [0x"sv
+                                 << util::hex(hr).to_string_view() << ']';
+            }
+          }
+        }
+      }
+#else
+      {
+        if (!session->mic.warn_once_no_platform) {
+          session->mic.warn_once_no_platform = true;
+          BOOST_LOG(warning) << "Mic packet received but host platform has no mic-input support yet"sv;
+        }
+        (void) pcmBuffer;
+      }
+#endif
     });
 
     server->map(packetTypes[IDX_ENCRYPTED], [server](session_t *session, const std::string_view &payload) {
@@ -2320,6 +2817,19 @@ namespace stream {
 
       session->control.peer = nullptr;
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);
+
+      // Client-to-host microphone: allocate a decoder only when the client
+      // advertised ML_FF_MIC_INPUT. Stock clients allocate nothing.
+      session->mic.client_advertised = (config.mlFeatureFlags & ML_FF_MIC_INPUT) != 0;
+      if (session->mic.client_advertised) {
+        int opus_err = 0;
+        OpusDecoder *raw_decoder = opus_decoder_create(48000, 1, &opus_err);
+        if (raw_decoder == nullptr || opus_err != OPUS_OK) {
+          BOOST_LOG(error) << "Mic decoder: opus_decoder_create failed: "sv << opus_strerror(opus_err);
+        } else {
+          session->mic.decoder.reset(raw_decoder);
+        }
+      }
 
       session->mail = std::move(mail);
 
