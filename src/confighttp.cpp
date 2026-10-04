@@ -1777,16 +1777,14 @@ namespace confighttp {
    *          connection index (port).
    * @return True when the hub accepted the port reset.
    */
-  bool usb_cycle_port(DEVINST devinst) {
+  /** @brief Find the parent USB hub instance id and connection index (port) for a node. */
+  bool find_hub_and_port(DEVINST devinst, std::string &hub_id, ULONG &connection_index) {
     DEVINST node = devinst;
-    ULONG connection_index = 0;
-    std::string hub_id;
-
     for (int depth = 0; depth < 16; ++depth) {
       const std::string service = device_string_property(node, drp_service);
       if (service.find("usbhub") != std::string::npos || service.find("USBHUB") != std::string::npos) {
         hub_id = device_instance_id(node);
-        break;
+        return true;
       }
 
       // The connection index is the address of the child below the hub.
@@ -1800,7 +1798,11 @@ namespace confighttp {
       }
       node = parent;
     }
+    return false;
+  }
 
+  /** @brief Reset a specific USB hub port (IOCTL_USB_HUB_CYCLE_PORT). */
+  bool cycle_port(const std::string &hub_id, ULONG connection_index) {
     if (hub_id.empty()) {
       return false;
     }
@@ -1829,6 +1831,18 @@ namespace confighttp {
     DWORD returned = 0;
     const BOOL ok = DeviceIoControl(hub, ioctl_usb_hub_cycle_port, &params, sizeof(params), &params, sizeof(params), &returned, nullptr);
     return ok != FALSE && params.StatusReturned == ERROR_SUCCESS;
+  }
+
+  /**
+   * @brief Reset the USB port a device is attached to (IOCTL_USB_HUB_CYCLE_PORT).
+   */
+  bool usb_cycle_port(DEVINST devinst) {
+    std::string hub_id;
+    ULONG port = 0;
+    if (!find_hub_and_port(devinst, hub_id, port)) {
+      return false;
+    }
+    return cycle_port(hub_id, port);
   }
 
   /**
@@ -2380,6 +2394,8 @@ namespace confighttp {
     std::string instance_id;  ///< Device instance ID that was blocked.
     std::string method;       ///< `disabled`, `removed`, or `ejected`.
     std::string parent_id;    ///< Parent (hub) instance ID, for re-enumeration restore.
+    std::string hub_id;       ///< USB hub instance ID owning the port (for a port cycle).
+    ULONG port = 0;           ///< Connection index (port) on that hub.
   };
 
   /**
@@ -2410,11 +2426,21 @@ namespace confighttp {
             target.instance_id = wide_to_utf8(cursor);
           } else {
             const auto second = entry.find(L'\t', first + 1);
+            const auto third = (second == std::wstring::npos) ? std::wstring::npos : entry.find(L'\t', second + 1);
+            const auto fourth = (third == std::wstring::npos) ? std::wstring::npos : entry.find(L'\t', third + 1);
             target.instance_id = wide_to_utf8(entry.substr(0, first).c_str());
             const auto method = entry.substr(first + 1, second == std::wstring::npos ? std::wstring::npos : second - first - 1);
             target.method = wide_to_utf8(method.c_str());
             if (second != std::wstring::npos) {
-              target.parent_id = wide_to_utf8(entry.substr(second + 1).c_str());
+              target.parent_id = wide_to_utf8(entry.substr(second + 1, third == std::wstring::npos ? std::wstring::npos : third - second - 1).c_str());
+            }
+            if (third != std::wstring::npos) {
+              target.hub_id = wide_to_utf8(entry.substr(third + 1, fourth == std::wstring::npos ? std::wstring::npos : fourth - third - 1).c_str());
+            }
+            if (fourth != std::wstring::npos) {
+              try {
+                target.port = static_cast<ULONG>(std::stoul(wide_to_utf8(entry.substr(fourth + 1).c_str())));
+              } catch (...) {}
             }
           }
           if (target.method.empty()) {
@@ -2446,11 +2472,17 @@ namespace confighttp {
         const std::wstring wide(target.instance_id.begin(), target.instance_id.end());
         const std::wstring method(target.method.begin(), target.method.end());
         const std::wstring parent(target.parent_id.begin(), target.parent_id.end());
+        const std::wstring hub(target.hub_id.begin(), target.hub_id.end());
+        const std::wstring port(std::to_wstring(target.port));
         buffer.insert(buffer.end(), wide.begin(), wide.end());
         buffer.push_back(L'\t');
         buffer.insert(buffer.end(), method.begin(), method.end());
         buffer.push_back(L'\t');
         buffer.insert(buffer.end(), parent.begin(), parent.end());
+        buffer.push_back(L'\t');
+        buffer.insert(buffer.end(), hub.begin(), hub.end());
+        buffer.push_back(L'\t');
+        buffer.insert(buffer.end(), port.begin(), port.end());
         buffer.push_back(L'\0');
       }
       buffer.push_back(L'\0');
@@ -2478,6 +2510,15 @@ namespace confighttp {
    * @return True when the target was restored (or re-enumerated via its parent).
    */
   bool restore_target(const blocked_target_t &target) {
+    // Removed/ejected: software replug by cycling the recorded hub port. This works
+    // even when the device node is already gone (phantom), unlike a parent
+    // re-enumerate which does not reliably re-attach a removed USB device.
+    if ((target.method == "removed" || target.method == "ejected") && !target.hub_id.empty()) {
+      if (cycle_port(target.hub_id, target.port)) {
+        return true;
+      }
+    }
+
     std::wstring wide(target.instance_id.begin(), target.instance_id.end());
 
     // Present node: restore in place.
@@ -2555,6 +2596,9 @@ namespace confighttp {
         target.instance_id = id;
         target.method = result == "already_blocked" ? block_method(*it) : result;
         target.parent_id = parent_instance_id(*it);
+        // Record the hub + port so restore can do a "software replug" even if the
+        // device node is already gone.
+        find_hub_and_port(*it, target.hub_id, target.port);
         add_blocked_target(target);
         return {group_key, id, result};
       }
