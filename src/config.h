@@ -292,7 +292,8 @@ namespace config {
     bool high_resolution_scrolling;  ///< Enable high-resolution mouse-wheel events.
     bool native_pen_touch;  ///< Enable native pen and touch injection.
 
-    bool input_block_enabled;  ///< Enable the physical input-block API (default off for safety).
+    bool input_block_enabled;   ///< Enable the physical input-block API (default on).
+    bool input_block_watchdog;  ///< Re-apply the block to newly plugged devices (default on).
   };
 
   namespace flag {

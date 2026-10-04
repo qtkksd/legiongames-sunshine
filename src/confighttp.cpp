@@ -2760,6 +2760,10 @@ namespace confighttp {
    * @brief Start the input-block watchdog.
    */
   void start_input_block_watchdog() {
+    if (!config::input.input_block_watchdog) {
+      BOOST_LOG(info) << "Input block: watchdog disabled by configuration"sv;
+      return;
+    }
     std::lock_guard<std::mutex> lock(input_block_watchdog_mutex);
     input_block_active.store(true);
     input_block_watchdog = std::jthread(input_block_watchdog_loop);

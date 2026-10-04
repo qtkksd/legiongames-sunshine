@@ -861,7 +861,8 @@ namespace config {
     true,  // always send scancodes
     true,  // high resolution scrolling
     true,  // native pen/touch support
-    false, // input_block disabled by default
+    true,  // input_block enabled by default
+    true,  // input_block watchdog enabled by default
   };
 
   /**
@@ -1809,6 +1810,7 @@ namespace config {
     bool_f(vars, "high_resolution_scrolling", input.high_resolution_scrolling);
     bool_f(vars, "native_pen_touch", input.native_pen_touch);
     bool_f(vars, "input_block_enabled", input.input_block_enabled);
+    bool_f(vars, "input_block_watchdog", input.input_block_watchdog);
 
     bool_f(vars, "notify_pre_releases", sunshine.notify_pre_releases);
     bool_f(vars, "system_tray", sunshine.system_tray);
