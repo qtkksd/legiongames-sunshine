@@ -1403,8 +1403,15 @@ namespace platf {
     // If Steam Streaming Speakers are currently the default audio device,
     // change the default to something else (if another device is available).
     audio::audio_control_t audio_ctrl;
+
+    // Provision the bundled Steam Streaming Microphone driver at startup
+    // (best effort, skipped when already present) so no manual setup or stream
+    // is required for the device to be ready.
+    audio_ctrl.install_steam_microphone_driver();
+
     if (audio_ctrl.init() == 0) {
       audio_ctrl.reset_default_device();
+      audio_ctrl.reset_default_microphone();
     }
 
     return co_init;
