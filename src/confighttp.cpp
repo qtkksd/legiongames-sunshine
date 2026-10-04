@@ -1945,6 +1945,9 @@ namespace confighttp {
     return SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, set, &info) != FALSE;
   }
 
+  /** @brief Verbose per-node logging (on for block/unblock; off for the watchdog). */
+  std::atomic<bool> input_block_verbose {false};
+
   /**
    * @brief Force-disable a node by setting CONFIGFLAG_DISABLED and re-enumerating.
    * @details Last resort for nodes that refuse CM_Disable_DevNode (CR_NOT_DISABLEABLE).
@@ -1952,6 +1955,7 @@ namespace confighttp {
   bool registry_disable(DEVINST devinst) {
     HKEY key = nullptr;
     if (CM_Open_DevNode_Key(devinst, KEY_QUERY_VALUE | KEY_SET_VALUE, 0, RegDisposition_OpenExisting, &key, CM_REGISTRY_HARDWARE) != CR_SUCCESS) {
+      BOOST_LOG(debug) << "Input block: CM_Open_DevNode_Key failed for "sv << device_instance_id(devinst);
       return false;
     }
 
@@ -1959,10 +1963,15 @@ namespace confighttp {
     DWORD size = sizeof(flags);
     DWORD type = 0;
     RegQueryValueExW(key, L"ConfigFlags", nullptr, &type, reinterpret_cast<LPBYTE>(&flags), &size);
+    const DWORD before = flags;
     flags |= 0x00000001;  // CONFIGFLAG_DISABLED
 
     const bool ok = RegSetValueExW(key, L"ConfigFlags", 0, REG_DWORD, reinterpret_cast<const BYTE *>(&flags), sizeof(flags)) == ERROR_SUCCESS;
     RegCloseKey(key);
+
+    if (input_block_verbose.load()) {
+      BOOST_LOG(info) << "Input block: ConfigFlags "sv << before << " -> "sv << flags << " ok="sv << ok << " for "sv << device_instance_id(devinst);
+    }
 
     if (ok) {
       CM_Reenumerate_DevNode(devinst, 0);
@@ -2008,8 +2017,109 @@ namespace confighttp {
   }
 
   /**
-   * @brief Disable a device node: CM API, then Device Manager path, then a forced
-   *        registry disable. Returns a result string.
+   * @brief Poll until a node reports disabled (registry re-enumeration is async).
+   */
+  bool wait_disabled(DEVINST devinst, int tries = 10) {
+    for (int i = 0; i < tries; ++i) {
+      if (node_is_disabled(devinst)) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return node_is_disabled(devinst);
+  }
+
+  /** @brief Registry location recording force-disabled target instance ids. */
+  constexpr wchar_t input_block_state_key[] = L"SOFTWARE\\LegionGames\\Sunshine\\InputBlock";
+
+  /**
+   * @brief Read the recorded force-disabled target instance ids.
+   */
+  std::vector<std::string> read_disabled_targets() {
+    std::vector<std::string> result;
+
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, input_block_state_key, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) {
+      return result;
+    }
+
+    DWORD type = 0;
+    DWORD size = 0;
+    if (RegQueryValueExW(key, L"DisabledTargets", nullptr, &type, nullptr, &size) == ERROR_SUCCESS && size >= sizeof(wchar_t)) {
+      std::vector<wchar_t> buffer(size / sizeof(wchar_t) + 1, L'\0');
+      if (RegQueryValueExW(key, L"DisabledTargets", nullptr, &type, reinterpret_cast<LPBYTE>(buffer.data()), &size) == ERROR_SUCCESS) {
+        const wchar_t *cursor = buffer.data();
+        while (*cursor) {
+          const std::wstring entry(cursor);
+          result.push_back(wide_to_utf8(cursor));
+          cursor += entry.size() + 1;
+        }
+      }
+    }
+    RegCloseKey(key);
+    return result;
+  }
+
+  /**
+   * @brief Write (or clear) the recorded force-disabled target instance ids.
+   */
+  void write_disabled_targets(const std::vector<std::string> &ids) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, input_block_state_key, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+      return;
+    }
+
+    if (ids.empty()) {
+      RegDeleteValueW(key, L"DisabledTargets");
+    } else {
+      std::vector<wchar_t> buffer;
+      for (const auto &id : ids) {
+        const std::wstring wide(id.begin(), id.end());
+        buffer.insert(buffer.end(), wide.begin(), wide.end());
+        buffer.push_back(L'\0');
+      }
+      buffer.push_back(L'\0');
+      RegSetValueExW(key, L"DisabledTargets", 0, REG_MULTI_SZ, reinterpret_cast<const BYTE *>(buffer.data()), static_cast<DWORD>(buffer.size() * sizeof(wchar_t)));
+    }
+    RegCloseKey(key);
+  }
+
+  /**
+   * @brief Record a force-disabled target instance id (idempotent).
+   */
+  void add_disabled_target(const std::string &id) {
+    auto ids = read_disabled_targets();
+    if (std::find(ids.begin(), ids.end(), id) == ids.end()) {
+      ids.push_back(id);
+      write_disabled_targets(ids);
+    }
+  }
+
+  /**
+   * @brief Enable a device by instance id (for recorded force-disabled targets).
+   */
+  bool enable_by_instance_id(const std::string &instance_id) {
+    const std::wstring wide(instance_id.begin(), instance_id.end());
+    DEVINST devinst = 0;
+    if (CM_Locate_DevNodeW(&devinst, const_cast<wchar_t *>(wide.c_str()), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS) {
+      return false;
+    }
+    if (CM_Enable_DevNode(devinst, 0) == CR_SUCCESS && !node_is_disabled(devinst)) {
+      return true;
+    }
+    if (setupdi_set_state(devinst, DICS_ENABLE) && !node_is_disabled(devinst)) {
+      return true;
+    }
+    if (registry_enable(devinst) && !node_is_disabled(devinst)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * @brief Disable a device node: CM API, then Device Manager path, then the forced
+   *        registry disable (which bypasses the DN_DISABLEABLE gate). The registry
+   *        re-enumeration is asynchronous, so we poll after it.
    */
   std::string disable_node(DEVINST devinst, const std::string &name) {
     CONFIGRET cr = CM_Disable_DevNode(devinst, CM_DISABLE_UI_NOT_OK);
@@ -2024,11 +2134,15 @@ namespace confighttp {
       return "disabled";
     }
 
-    if (registry_disable(devinst) && node_is_disabled(devinst)) {
+    if (registry_disable(devinst) && wait_disabled(devinst)) {
       return "disabled";
     }
 
-    BOOST_LOG(warning) << "Input block: could not disable ["sv << static_cast<unsigned long>(cr) << "] "sv << name;
+    if (input_block_verbose.load()) {
+      BOOST_LOG(warning) << "Input block: could not disable ["sv << static_cast<unsigned long>(cr) << "] "sv << name;
+    } else {
+      BOOST_LOG(debug) << "Input block: could not disable ["sv << static_cast<unsigned long>(cr) << "] "sv << name;
+    }
     return std::format("error_{}", static_cast<unsigned long>(cr));
   }
 
@@ -2062,6 +2176,7 @@ namespace confighttp {
       }
       const std::string result = disable_node(*it, id);
       if (result == "disabled") {
+        add_disabled_target(id);
         return {group_key, id, result};
       }
     }
@@ -2135,6 +2250,24 @@ namespace confighttp {
           entry["result"] = enable_device(device);
         }
         results.push_back(std::move(entry));
+      }
+
+      // Enable nodes that were force-disabled and recorded — the class scans above can
+      // miss them (e.g. a USB interface node whose class is HIDClass).
+      for (const auto &id : read_disabled_targets()) {
+        nlohmann::json entry;
+        entry["name"] = id;
+        entry["instance_id"] = id;
+        if (dry_run) {
+          entry["result"] = "would_enable";
+        } else {
+          entry["result"] = enable_by_instance_id(id) ? "enabled" : "error_enable";
+        }
+        results.push_back(std::move(entry));
+      }
+
+      if (!dry_run) {
+        write_disabled_targets({});
       }
     }
 
@@ -2339,8 +2472,12 @@ namespace confighttp {
       results = apply_input_state(false, true);
     } else {
       stop_input_block_watchdog();
-      std::lock_guard<std::mutex> lock(input_block_mutex);
-      results = apply_input_state(false, false);
+      input_block_verbose.store(true);
+      {
+        std::lock_guard<std::mutex> lock(input_block_mutex);
+        results = apply_input_state(false, false);
+      }
+      input_block_verbose.store(false);
     }
 
     const int disabled_count = count_results(results, "disabled");
@@ -2357,8 +2494,9 @@ namespace confighttp {
     output_tree["duplicate_count"] = duplicate_count;
     output_tree["devices"] = results;
 
-    if (!dry_run) {
+    if (!dry_run && disabled_count > 0) {
       // Watchdog re-applies the block to catch newly plugged physical devices.
+      // Only start it when something was actually disabled (avoids retry/log spam).
       start_input_block_watchdog();
     }
 
@@ -2403,8 +2541,12 @@ namespace confighttp {
       results = apply_input_state(true, true);
     } else {
       stop_input_block_watchdog();
-      std::lock_guard<std::mutex> lock(input_block_mutex);
-      results = apply_input_state(true, false);
+      input_block_verbose.store(true);
+      {
+        std::lock_guard<std::mutex> lock(input_block_mutex);
+        results = apply_input_state(true, false);
+      }
+      input_block_verbose.store(false);
     }
 
     const int enabled_count = count_results(results, "enabled");
