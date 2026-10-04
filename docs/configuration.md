@@ -688,6 +688,55 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### input_block_enabled
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            When enabled, the physical input-block API (<code>/api/input-block/block</code>) may eject
+            physical keyboards and mice so a local user cannot interfere with a remote session.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            input_block_enabled = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### input_block_watchdog
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            When enabled, an active block is re-applied every few seconds so a re-plugged keyboard or
+            mouse is blocked again. Only applies while a block is active.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">
+            @code{}
+            input_block_watchdog = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ### keybindings
 
 <table>
