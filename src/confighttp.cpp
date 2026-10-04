@@ -2479,17 +2479,18 @@ namespace confighttp {
    */
   bool restore_target(const blocked_target_t &target) {
     std::wstring wide(target.instance_id.begin(), target.instance_id.end());
+
+    // Present node: restore in place.
     DEVINST devinst = 0;
-    bool located = CM_Locate_DevNodeW(&devinst, wide.data(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS;
-    if (!located) {
-      located = CM_Locate_DevNodeW(&devinst, wide.data(), CM_LOCATE_DEVNODE_PHANTOM) == CR_SUCCESS;
+    if (CM_Locate_DevNodeW(&devinst, wide.data(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS) {
+      if (restore_node(devinst, target.method == "ejected")) {
+        return true;
+      }
     }
 
-    if (located && restore_node(devinst, target.method == "ejected")) {
-      return true;
-    }
-
-    // Re-enumerate the recorded parent so a removed/ejected child re-attaches.
+    // Removed/ejected node (now phantom): re-enumerate the recorded parent so the
+    // child re-attaches. A phantom has no block problem code, so restore_node alone
+    // would wrongly report success without actually bringing the device back.
     if (!target.parent_id.empty()) {
       std::wstring wide_parent(target.parent_id.begin(), target.parent_id.end());
       DEVINST parent = 0;
