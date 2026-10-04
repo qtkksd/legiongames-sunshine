@@ -3142,7 +3142,125 @@ namespace confighttp {
       return (res == CURLE_OK) ? result : "";
     }
 
-    void upgrade_background_task(bool force) {
+#ifdef _WIN32
+    /** @brief Appdata path of the persisted upgrade state. */
+    std::filesystem::path upgrade_state_path() {
+      return std::filesystem::path(platf::appdata()) / "upgrade_state.json";
+    }
+
+    /** @brief Read the persisted upgrade state (empty object when absent). */
+    nlohmann::json read_upgrade_state() {
+      try {
+        const std::string content = file_handler::read_file(upgrade_state_path().string().c_str());
+        if (!content.empty()) {
+          return nlohmann::json::parse(content);
+        }
+      } catch (...) {}
+      return nlohmann::json::object();
+    }
+
+    /** @brief Persist the upgrade state. */
+    void write_upgrade_state(const nlohmann::json &state) {
+      file_handler::write_file(upgrade_state_path().string().c_str(), state.dump(2));
+    }
+
+    /**
+     * @brief Run a command synchronously and return its exit code (-1 on launch error).
+     */
+    int run_and_wait(const std::string &cmd, const boost::filesystem::path &working_dir) {
+      std::error_code ec;
+      boost::filesystem::path wd = working_dir;
+      boost::process::v1::environment env = boost::this_process::environment();
+      // Elevated: the install lives under Program Files, so the backup (robocopy)
+      // and the scheduled-task registration both need administrator rights.
+      auto child = platf::run_command(true, false, cmd, wd, env, nullptr, ec, nullptr);
+      if (ec || !child.valid()) {
+        return -1;
+      }
+      child.wait(ec);
+      return ec ? -1 : child.exit_code();
+    }
+
+    /**
+     * @brief Back up the current install and arm the update health supervisor.
+     * @details Copies program files (excluding `config/` and `rollback/`) to
+     *          `<install>/rollback/<from_commit>/`, writes `upgrade_state.json`, and
+     *          registers + starts the one-shot `SunshineUpdateVerify` task that runs
+     *          `scripts/update-supervisor.ps1`. That supervisor polls `/api/health`
+     *          after the install and rolls back to @p from_commit if the new build
+     *          never comes online. Best effort: returns false (update still proceeds)
+     *          when the backup or task registration fails.
+     */
+    bool arm_update_supervisor(const std::string &from_commit, const std::string &to_commit) {
+      wchar_t exe_path[MAX_PATH] {};
+      if (GetModuleFileNameW(nullptr, exe_path, ARRAYSIZE(exe_path)) == 0) {
+        BOOST_LOG(warning) << "Upgrade: cannot resolve install directory for rollback"sv;
+        return false;
+      }
+
+      const std::filesystem::path install_dir = std::filesystem::path(exe_path).parent_path();
+      const std::filesystem::path config_dir = install_dir / L"config";
+      const std::filesystem::path rollback_root = install_dir / L"rollback";
+      const std::filesystem::path backup_dir = rollback_root / std::wstring(from_commit.begin(), from_commit.end());
+      const std::filesystem::path supervisor_script = install_dir / L"scripts" / L"update-supervisor.ps1";
+      const std::filesystem::path launcher = config_dir / L"update-supervisor-launch.cmd";
+
+      std::error_code ec;
+      if (!std::filesystem::exists(supervisor_script, ec)) {
+        BOOST_LOG(warning) << "Upgrade: update-supervisor.ps1 not present, skipping rollback supervision"sv;
+        return false;
+      }
+
+      // 1. Back up program files (exclude config and the rollback tree itself).
+      std::filesystem::create_directories(backup_dir, ec);
+      const std::string backup_cmd = std::format(
+        "robocopy \"{}\" \"{}\" /E /XD \"{}\" \"{}\" /R:0 /W:0 /NFL /NDL /NJH /NJS /NP",
+        install_dir.string(), backup_dir.string(), config_dir.string(), rollback_root.string());
+      const int rc = run_and_wait(backup_cmd, boost::filesystem::path(install_dir.string()));
+      if (rc < 0 || (rc & 8) != 0) {
+        BOOST_LOG(warning) << "Upgrade: rollback backup failed (robocopy "sv << rc << "), skipping rollback supervision"sv;
+        return false;
+      }
+      BOOST_LOG(info) << "Upgrade: rollback backup created at "sv << backup_dir.string();
+
+      // 2. Persist the state the supervisor reads.
+      nlohmann::json state;
+      state["phase"] = "preparing";
+      state["from_commit"] = from_commit;
+      state["to_commit"] = to_commit;
+      state["install_dir"] = install_dir.string();
+      state["backup_dir"] = backup_dir.string();
+      state["port"] = static_cast<int>(net::map_port(PORT_HTTPS));
+      state["started_at"] = static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+      write_upgrade_state(state);
+
+      // 3. Launcher .cmd keeps PowerShell quoting out of the schtasks action.
+      const std::string launcher_content = std::format(
+        "@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\" -State \"{}\"\r\n",
+        supervisor_script.string(), upgrade_state_path().string());
+      file_handler::write_file(launcher.string().c_str(), launcher_content);
+
+      // 4. Register + start the one-shot task (the ONSTART trigger also covers a reboot).
+      const std::string create_cmd = std::format(
+        "schtasks /Create /TN SunshineUpdateVerify /TR \"{}\" /SC ONSTART /RU SYSTEM /RL HIGHEST /F",
+        launcher.string());
+      const int create_rc = run_and_wait(create_cmd, boost::filesystem::path());
+      if (create_rc != 0) {
+        BOOST_LOG(warning) << "Upgrade: failed to register supervisor task ("sv << create_rc << ")"sv;
+        return false;
+      }
+      const int run_rc = run_and_wait("schtasks /Run /TN SunshineUpdateVerify", boost::filesystem::path());
+      if (run_rc != 0) {
+        BOOST_LOG(warning) << "Upgrade: failed to start supervisor task ("sv << run_rc << ")"sv;
+        return false;
+      }
+
+      BOOST_LOG(info) << "Upgrade: update supervisor armed (rollback to "sv << from_commit << ")"sv;
+      return true;
+    }
+#endif
+
+    void upgrade_background_task(bool force, bool rollback_on_failure) {
       upgrade_in_progress.store(true);
       {
         std::lock_guard<std::mutex> lock(upgrade_mutex);
@@ -3257,7 +3375,15 @@ namespace confighttp {
         return;
       }
 
-      BOOST_LOG(info) << "Upgrade: installer downloaded, running silent install..."sv;
+      BOOST_LOG(info) << "Upgrade: installer downloaded (rollback_on_failure="sv << rollback_on_failure << "), running silent install..."sv;
+
+#ifdef _WIN32
+      if (rollback_on_failure) {
+        // Arm the health supervisor BEFORE installing: it survives the service
+        // swap and rolls back to this version if the new build never comes online.
+        arm_update_supervisor(upgrade_current_version, latest_commit);
+      }
+#endif
 
       // 5. Run installer
       std::error_code ec;
@@ -3396,6 +3522,32 @@ namespace confighttp {
       output_tree["error"] = upgrade_last_error;
     }
 
+#ifdef _WIN32
+    // Persisted update-supervisor state (phase: preparing/verifying/success/rolled_back).
+    const auto state = read_upgrade_state();
+    if (!state.empty()) {
+      output_tree["phase"] = state.value("phase", "");
+      output_tree["from_commit"] = state.value("from_commit", "");
+      output_tree["to_commit"] = state.value("to_commit", "");
+    }
+#endif
+
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Lightweight health probe used by the update supervisor.
+   * @details Unauthenticated on purpose: the update supervisor runs as SYSTEM and
+   *          polls it over loopback to confirm the new build came online.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/health| GET| null}
+   */
+  void getHealth(const resp_https_t &response, const req_https_t &) {
+    nlohmann::json output_tree;
+    output_tree["status"] = "ok";
+    output_tree["commit"] = std::string(PROJECT_VERSION_COMMIT);
     send_response(response, output_tree);
   }
 
@@ -3418,11 +3570,13 @@ namespace confighttp {
 
     print_req(request);
 
-    // Parse force flag from request body
+    // Parse flags from request body
     bool force = false;
+    bool rollback_on_failure = true;
     try {
       auto body = nlohmann::json::parse(request->content.string());
       force = body.value("force", false);
+      rollback_on_failure = body.value("rollback_on_failure", true);
     } catch (...) {}
 
     nlohmann::json output_tree;
@@ -3436,7 +3590,7 @@ namespace confighttp {
       return;
     }
 
-    std::thread upgrade_thread(upgrade_background_task, force);
+    std::thread upgrade_thread(upgrade_background_task, force, rollback_on_failure);
     upgrade_thread.detach();
 
     output_tree["status"] = true;
@@ -3812,6 +3966,7 @@ namespace confighttp {
     server.resource["^/api/input-block/unblock$"]["POST"] = unblockInput;
     server.resource["^/api/input-block/monitor/off$"]["POST"] = monitorOff;
     server.resource["^/api/input-block/monitor/on$"]["POST"] = monitorOn;
+    server.resource["^/api/health$"]["GET"] = getHealth;
     server.resource["^/api/upgrade/status$"]["GET"] = getUpgradeStatus;
     server.resource["^/api/upgrade$"]["POST"] = doUpgrade;
     server.resource["^/api/update-netbird/status$"]["GET"] = getNetBirdUpdateStatus;
