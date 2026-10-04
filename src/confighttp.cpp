@@ -3485,11 +3485,23 @@ namespace confighttp {
       const std::filesystem::path rollback_root = install_dir / L"rollback";
       const std::filesystem::path backup_dir = rollback_root / std::wstring(from_commit.begin(), from_commit.end());
       const std::filesystem::path supervisor_script = install_dir / L"scripts" / L"update-supervisor.ps1";
+      const std::filesystem::path config_script = config_dir / L"update-supervisor.ps1";
       const std::filesystem::path launcher = config_dir / L"update-supervisor-launch.cmd";
+      const std::filesystem::path arm_log = config_dir / L"update-arm.log";
+
+      // Persist arm progress to config/ (sunshine.log rotates on restart, losing it).
+      auto log_arm = [&](const std::string &line) {
+        std::ofstream out(arm_log, std::ios::app);
+        if (out) {
+          out << std::format("[{}] {}\n",
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()), line);
+        }
+      };
 
       std::error_code ec;
       if (!std::filesystem::exists(supervisor_script, ec)) {
         BOOST_LOG(warning) << "Upgrade: update-supervisor.ps1 not present, skipping rollback supervision"sv;
+        log_arm("supervisor script missing; skipped");
         return false;
       }
 
@@ -3499,6 +3511,7 @@ namespace confighttp {
         "robocopy \"{}\" \"{}\" /E /XD \"{}\" \"{}\" /R:0 /W:0 /NFL /NDL /NJH /NJS /NP",
         install_dir.string(), backup_dir.string(), config_dir.string(), rollback_root.string());
       const int rc = run_and_wait(backup_cmd, boost::filesystem::path(install_dir.string()));
+      log_arm(std::format("backup rc={}", rc));
       if (rc < 0 || (rc & 8) != 0) {
         BOOST_LOG(warning) << "Upgrade: rollback backup failed (robocopy "sv << rc << "), skipping rollback supervision"sv;
         return false;
@@ -3516,28 +3529,45 @@ namespace confighttp {
       state["started_at"] = static_cast<long long>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
       write_upgrade_state(state);
 
-      // 3. Launcher .cmd keeps PowerShell quoting out of the schtasks action.
+      // 3. Stage the supervisor into config/ so it survives the installer's
+      //    uninstall-before-install (scripts/ is removed mid-update).
+      std::filesystem::copy_file(supervisor_script, config_script, std::filesystem::copy_options::overwrite_existing, ec);
+      if (ec) {
+        log_arm(std::format("stage supervisor failed: {}", ec.message()));
+        BOOST_LOG(warning) << "Upgrade: failed to stage supervisor script ("sv << ec.message() << ")"sv;
+        return false;
+      }
+
+      // 4. Launcher: absolute PowerShell path, staged script, short delay so the
+      //    install settles first. The task action runs it via cmd.exe.
       const std::string launcher_content = std::format(
-        "@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\" -State \"{}\"\r\n",
-        supervisor_script.string(), upgrade_state_path().string());
+        "@echo off\r\n"
+        "ping -n 21 127.0.0.1 >nul\r\n"
+        "\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File \"{}\" -State \"{}\"\r\n",
+        config_script.string(), upgrade_state_path().string());
       file_handler::write_file(launcher.string().c_str(), launcher_content);
 
-      // 4. Register + start the one-shot task (the ONSTART trigger also covers a reboot).
+      // 5. Register + start the one-shot task. The action goes through cmd.exe so
+      //    Task Scheduler never has to launch a .cmd directly (that returned
+      //    ERROR_FILE_NOT_FOUND, 0x80070002).
       const std::string create_cmd = std::format(
-        "schtasks /Create /TN SunshineUpdateVerify /TR \"{}\" /SC ONSTART /RU SYSTEM /RL HIGHEST /F",
+        "schtasks /Create /TN SunshineUpdateVerify /TR \"cmd.exe /c \\\"{}\\\"\" /SC ONSTART /RU SYSTEM /RL HIGHEST /F",
         launcher.string());
       const int create_rc = run_and_wait(create_cmd, boost::filesystem::path());
+      log_arm(std::format("schtasks create rc={}", create_rc));
       if (create_rc != 0) {
         BOOST_LOG(warning) << "Upgrade: failed to register supervisor task ("sv << create_rc << ")"sv;
         return false;
       }
       const int run_rc = run_and_wait("schtasks /Run /TN SunshineUpdateVerify", boost::filesystem::path());
+      log_arm(std::format("schtasks run rc={}", run_rc));
       if (run_rc != 0) {
         BOOST_LOG(warning) << "Upgrade: failed to start supervisor task ("sv << run_rc << ")"sv;
         return false;
       }
 
       BOOST_LOG(info) << "Upgrade: update supervisor armed (rollback to "sv << from_commit << ")"sv;
+      log_arm("armed");
       return true;
     }
 #endif
