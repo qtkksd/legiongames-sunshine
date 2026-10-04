@@ -1632,6 +1632,20 @@ namespace confighttp {
   constexpr ULONG drp_compatible_ids = 0x00000003;
   constexpr ULONG drp_service = 0x00000005;
 
+  // Device problem codes / flags for the eject-remove block (fallbacks if the SDK omits them).
+#ifndef CM_PROB_WILL_BE_REMOVED
+  #define CM_PROB_WILL_BE_REMOVED 0x00000015
+#endif
+#ifndef CM_PROB_HELD_FOR_EJECT
+  #define CM_PROB_HELD_FOR_EJECT 0x0000002F
+#endif
+#ifndef CM_REMOVE_UI_NOT_OK
+  #define CM_REMOVE_UI_NOT_OK 0x00000001
+#endif
+#ifndef CM_GET_DEVICE_INTERFACE_LIST_PRESENT
+  #define CM_GET_DEVICE_INTERFACE_LIST_PRESENT 0x00000000
+#endif
+
   /**
    * @brief Get the device instance ID string for a device node.
    */
@@ -1680,6 +1694,139 @@ namespace confighttp {
       return {};
     }
     return wide_to_utf8(buffer.data());
+  }
+
+  /**
+   * @brief Whether a device node reports a given problem code.
+   */
+  bool node_problem_is(DEVINST devinst, ULONG wanted) {
+    ULONG status = 0;
+    ULONG problem = 0;
+    return CM_Get_DevNode_Status(&status, &problem, devinst, 0) == CR_SUCCESS &&
+           (status & DN_HAS_PROBLEM) != 0 && problem == wanted;
+  }
+
+  /**
+   * @brief Whether a device node is currently disabled (problem code 22).
+   */
+  bool node_is_disabled(DEVINST devinst) {
+    return node_problem_is(devinst, CM_PROB_DISABLED);
+  }
+
+  /** @brief True when the node was marked for removal (eject/remove block, code 21). */
+  bool node_is_removed(DEVINST devinst) {
+    return node_problem_is(devinst, CM_PROB_WILL_BE_REMOVED);
+  }
+
+  /** @brief True when the node is held for eject (eject block, code 47). */
+  bool node_is_ejected(DEVINST devinst) {
+    return node_problem_is(devinst, CM_PROB_HELD_FOR_EJECT);
+  }
+
+  /** @brief True when the node is blocked by any block method (disabled, removed, ejected). */
+  bool node_is_blocked(DEVINST devinst) {
+    return node_is_disabled(devinst) || node_is_removed(devinst) || node_is_ejected(devinst);
+  }
+
+  /** @brief Instance id of a device node's parent (empty when root). */
+  std::string parent_instance_id(DEVINST devinst) {
+    DEVINST parent = 0;
+    if (CM_Get_Parent(&parent, devinst, 0) == CR_SUCCESS && parent != 0) {
+      return device_instance_id(parent);
+    }
+    return {};
+  }
+
+  /** @brief Infer the active block method from a node's problem code. */
+  std::string block_method(DEVINST devinst) {
+    if (node_is_ejected(devinst)) {
+      return "ejected";
+    }
+    if (node_is_removed(devinst)) {
+      return "removed";
+    }
+    return "disabled";
+  }
+
+  /** @brief Device property key for the USB connection index (DEVPKEY_Device_Address). */
+  constexpr DEVPROPKEY devpkey_device_address {
+    {0xA45C254E, 0xDF1C, 0x4EFD, {0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0}},
+    30
+  };
+
+  /** @brief Device interface GUID for USB hubs (GUID_DEVINTERFACE_USB_HUB). */
+  constexpr GUID guid_devinterface_usb_hub {
+    0xF18A0E88, 0xC30C, 0x11D0, {0x88, 0x15, 0x00, 0xA0, 0xC9, 0x06, 0xBE, 0xD8}
+  };
+
+  /** @brief Parameters for IOCTL_USB_HUB_CYCLE_PORT. */
+  struct usb_cycle_port_params_t {
+    ULONG ConnectionIndex;
+    ULONG StatusReturned;
+  };
+
+  // CTL_CODE(FILE_DEVICE_USB=FILE_DEVICE_UNKNOWN=0x22, USB_HUB_CYCLE_PORT=273, METHOD_BUFFERED=0, FILE_ANY_ACCESS=0).
+  constexpr ULONG ioctl_usb_hub_cycle_port = 0x00220444;
+
+  /**
+   * @brief Reset the USB port a device is attached to (IOCTL_USB_HUB_CYCLE_PORT).
+   * @details Reactivates a device held for eject (problem code 47). Walks up to the
+   *          parent USB hub, then issues the hub cycle-port IOCTL for the device's
+   *          connection index (port).
+   * @return True when the hub accepted the port reset.
+   */
+  bool usb_cycle_port(DEVINST devinst) {
+    DEVINST node = devinst;
+    ULONG connection_index = 0;
+    std::string hub_id;
+
+    for (int depth = 0; depth < 16; ++depth) {
+      const std::string service = device_string_property(node, drp_service);
+      if (service.find("usbhub") != std::string::npos || service.find("USBHUB") != std::string::npos) {
+        hub_id = device_instance_id(node);
+        break;
+      }
+
+      // The connection index is the address of the child below the hub.
+      DEVPROPTYPE type = 0;
+      ULONG size = sizeof(connection_index);
+      CM_Get_DevNode_PropertyW(node, &devpkey_device_address, &type, reinterpret_cast<PBYTE>(&connection_index), &size, 0);
+
+      DEVINST parent = 0;
+      if (CM_Get_Parent(&parent, node, 0) != CR_SUCCESS || parent == 0) {
+        break;
+      }
+      node = parent;
+    }
+
+    if (hub_id.empty()) {
+      return false;
+    }
+
+    std::wstring wide_hub(hub_id.begin(), hub_id.end());
+    ULONG list_size = 0;
+    if (CM_Get_Device_Interface_List_SizeW(&list_size, const_cast<LPGUID>(&guid_devinterface_usb_hub), wide_hub.data(), CM_GET_DEVICE_INTERFACE_LIST_PRESENT) != CR_SUCCESS || list_size == 0) {
+      return false;
+    }
+
+    std::vector<wchar_t> list(list_size, L'\0');
+    if (CM_Get_Device_Interface_ListW(const_cast<LPGUID>(&guid_devinterface_usb_hub), wide_hub.data(), list.data(), list_size, CM_GET_DEVICE_INTERFACE_LIST_PRESENT) != CR_SUCCESS) {
+      return false;
+    }
+
+    HANDLE hub = CreateFileW(list.data(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hub == INVALID_HANDLE_VALUE) {
+      return false;
+    }
+    auto close = util::fail_guard([hub]() {
+      CloseHandle(hub);
+    });
+
+    usb_cycle_port_params_t params {};
+    params.ConnectionIndex = connection_index;
+    DWORD returned = 0;
+    const BOOL ok = DeviceIoControl(hub, ioctl_usb_hub_cycle_port, &params, sizeof(params), &params, sizeof(params), &returned, nullptr);
+    return ok != FALSE && params.StatusReturned == ERROR_SUCCESS;
   }
 
   /**
@@ -1781,14 +1928,8 @@ namespace confighttp {
         SetupDiGetDeviceRegistryPropertyW(set, &info, SPDRP_FRIENDLYNAME, nullptr, reinterpret_cast<PBYTE>(friendly_name), sizeof(friendly_name), nullptr);
         device.name = friendly_name[0] ? wide_to_utf8(friendly_name) : id;
         device.devinst = info.DevInst;
-        device.disabled = false;
+        device.disabled = node_is_blocked(info.DevInst);
         device.disableable = false;
-
-        ULONG status = 0;
-        ULONG problem = 0;
-        if (CM_Get_DevNode_Status(&status, &problem, info.DevInst, 0) == CR_SUCCESS) {
-          device.disabled = (status & DN_HAS_PROBLEM) != 0 && problem == CM_PROB_DISABLED;
-        }
 
         devices.push_back(std::move(device));
       }
@@ -1832,13 +1973,12 @@ namespace confighttp {
       device.instance_id = wide_to_utf8(instance_id);
       device.name = friendly_name[0] ? wide_to_utf8(friendly_name) : device.instance_id;
       device.devinst = info.DevInst;
-      device.disabled = false;
+      device.disabled = node_is_blocked(info.DevInst);
       device.disableable = false;
 
       ULONG status = 0;
       ULONG problem = 0;
       if (CM_Get_DevNode_Status(&status, &problem, info.DevInst, 0) == CR_SUCCESS) {
-        device.disabled = (status & DN_HAS_PROBLEM) != 0 && problem == CM_PROB_DISABLED;
         device.disableable = (status & DN_DISABLEABLE) != 0;
       }
 
@@ -1869,24 +2009,17 @@ namespace confighttp {
 
   bool setupdi_set_state(DEVINST devinst, DWORD state_change);
   bool registry_enable(DEVINST devinst);
-  bool node_is_disabled(DEVINST devinst);
+  bool restore_node(DEVINST devinst, bool force_cycle = false);
 
   /**
-   * @brief Enable a single device node: CM API, then Device Manager path, then a
-   *        forced registry clear. Returns a result string.
+   * @brief Enable a single device node, restoring whichever block method was used
+   *        (disable, remove, or eject). Returns a result string.
    */
   std::string enable_device(const input_device_t &device) {
     if (!device.disabled) {
       return "already_enabled";
     }
-
-    if (CM_Enable_DevNode(device.devinst, 0) == CR_SUCCESS && !node_is_disabled(device.devinst)) {
-      return "enabled";
-    }
-    if (setupdi_set_state(device.devinst, DICS_ENABLE) && !node_is_disabled(device.devinst)) {
-      return "enabled";
-    }
-    if (registry_enable(device.devinst) && !node_is_disabled(device.devinst)) {
+    if (restore_node(device.devinst)) {
       return "enabled";
     }
 
@@ -2020,36 +2153,100 @@ namespace confighttp {
   }
 
   /**
-   * @brief Whether a device node is currently disabled.
+   * @brief Restore (unblock) a node blocked by any method.
+   * @details Eject (problem code 47) needs the USB port reset; remove (code 21)
+   *          and disable (code 22) need the device restarted/enabled.
+   * @return True when the node is no longer blocked.
    */
-  bool node_is_disabled(DEVINST devinst) {
-    ULONG status = 0;
-    ULONG problem = 0;
-    return CM_Get_DevNode_Status(&status, &problem, devinst, 0) == CR_SUCCESS &&
-           (status & DN_HAS_PROBLEM) != 0 && problem == CM_PROB_DISABLED;
+  bool restore_node(DEVINST devinst, bool force_cycle) {
+    if (force_cycle || node_is_ejected(devinst)) {
+      usb_cycle_port(devinst);
+    }
+
+    CM_Enable_DevNode(devinst, 0);
+    if (!node_is_blocked(devinst)) {
+      return true;
+    }
+
+    reenumerate_node(devinst);
+    if (!node_is_blocked(devinst)) {
+      return true;
+    }
+
+    if (setupdi_set_state(devinst, DICS_ENABLE) && !node_is_blocked(devinst)) {
+      return true;
+    }
+
+    if (registry_enable(devinst) && !node_is_blocked(devinst)) {
+      return true;
+    }
+
+    // Re-enumeration is asynchronous: give the node a moment to clear its problem.
+    for (int i = 0; i < 10 && node_is_blocked(devinst); ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return !node_is_blocked(devinst);
   }
 
   /**
-   * @brief Poll until a node reports disabled (registry re-enumeration is async).
+   * @brief Block a node by ejecting/removing it (problem codes 21/47).
+   * @details A different API family than CM_Disable_DevNode: works on nodes that
+   *          report CR_NOT_DISABLEABLE. CM_Query_And_Remove_SubTree marks the
+   *          subtree for removal (code 21); CM_Request_Device_Eject holds the
+   *          device for eject (code 47). Restore via restart / USB port reset.
+   * @return `removed`, `ejected`, or `error_<code>`.
    */
-  bool wait_disabled(DEVINST devinst, int tries = 10) {
+  std::string eject_node(DEVINST devinst, const std::string &name) {
+    // pVetoType / pszVetoName are optional; we only need the CONFIGRET.
+    CONFIGRET cr = CM_Query_And_Remove_SubTreeW(devinst, nullptr, nullptr, 0, CM_REMOVE_UI_NOT_OK);
+    if (cr == CR_SUCCESS || node_is_removed(devinst)) {
+      return "removed";
+    }
+
+    cr = CM_Request_Device_EjectW(devinst, nullptr, nullptr, 0, 0);
+    if (cr == CR_SUCCESS || node_is_ejected(devinst)) {
+      return "ejected";
+    }
+
+    if (input_block_verbose.load()) {
+      BOOST_LOG(info) << "Input block: eject/remove vetoed ["sv << static_cast<unsigned long>(cr) << "] "sv << name;
+    }
+    return std::format("error_{}", static_cast<unsigned long>(cr));
+  }
+
+  /**
+   * @brief Poll until a node reports blocked (registry re-enumeration is async).
+   */
+  bool wait_blocked(DEVINST devinst, int tries = 10) {
     for (int i = 0; i < tries; ++i) {
-      if (node_is_disabled(devinst)) {
+      if (node_is_blocked(devinst)) {
         return true;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    return node_is_disabled(devinst);
+    return node_is_blocked(devinst);
   }
 
-  /** @brief Registry location recording force-disabled target instance ids. */
+  /** @brief Registry location recording blocked target instance ids. */
   constexpr wchar_t input_block_state_key[] = L"SOFTWARE\\LegionGames\\Sunshine\\InputBlock";
 
   /**
-   * @brief Read the recorded force-disabled target instance ids.
+   * @brief A recorded blocked target (instance id + method + parent, for restore).
    */
-  std::vector<std::string> read_disabled_targets() {
-    std::vector<std::string> result;
+  struct blocked_target_t {
+    std::string instance_id;  ///< Device instance ID that was blocked.
+    std::string method;       ///< `disabled`, `removed`, or `ejected`.
+    std::string parent_id;    ///< Parent (hub) instance ID, for re-enumeration restore.
+  };
+
+  /**
+   * @brief Read the recorded blocked targets.
+   * @details Entries are stored as `<instance_id>\t<method>\t<parent_id>`. Legacy
+   *          entries (plain instance ids from earlier versions) are treated as
+   *          `disabled` with no parent.
+   */
+  std::vector<blocked_target_t> read_blocked_targets() {
+    std::vector<blocked_target_t> result;
 
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, input_block_state_key, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) {
@@ -2064,7 +2261,23 @@ namespace confighttp {
         const wchar_t *cursor = buffer.data();
         while (*cursor) {
           const std::wstring entry(cursor);
-          result.push_back(wide_to_utf8(cursor));
+          blocked_target_t target;
+          const auto first = entry.find(L'\t');
+          if (first == std::wstring::npos) {
+            target.instance_id = wide_to_utf8(cursor);
+          } else {
+            const auto second = entry.find(L'\t', first + 1);
+            target.instance_id = wide_to_utf8(entry.substr(0, first).c_str());
+            const auto method = entry.substr(first + 1, second == std::wstring::npos ? std::wstring::npos : second - first - 1);
+            target.method = wide_to_utf8(method.c_str());
+            if (second != std::wstring::npos) {
+              target.parent_id = wide_to_utf8(entry.substr(second + 1).c_str());
+            }
+          }
+          if (target.method.empty()) {
+            target.method = "disabled";
+          }
+          result.push_back(std::move(target));
           cursor += entry.size() + 1;
         }
       }
@@ -2074,21 +2287,27 @@ namespace confighttp {
   }
 
   /**
-   * @brief Write (or clear) the recorded force-disabled target instance ids.
+   * @brief Write (or clear) the recorded blocked targets.
    */
-  void write_disabled_targets(const std::vector<std::string> &ids) {
+  void write_blocked_targets(const std::vector<blocked_target_t> &targets) {
     HKEY key = nullptr;
     if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, input_block_state_key, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
       return;
     }
 
-    if (ids.empty()) {
+    if (targets.empty()) {
       RegDeleteValueW(key, L"DisabledTargets");
     } else {
       std::vector<wchar_t> buffer;
-      for (const auto &id : ids) {
-        const std::wstring wide(id.begin(), id.end());
+      for (const auto &target : targets) {
+        const std::wstring wide(target.instance_id.begin(), target.instance_id.end());
+        const std::wstring method(target.method.begin(), target.method.end());
+        const std::wstring parent(target.parent_id.begin(), target.parent_id.end());
         buffer.insert(buffer.end(), wide.begin(), wide.end());
+        buffer.push_back(L'\t');
+        buffer.insert(buffer.end(), method.begin(), method.end());
+        buffer.push_back(L'\t');
+        buffer.insert(buffer.end(), parent.begin(), parent.end());
         buffer.push_back(L'\0');
       }
       buffer.push_back(L'\0');
@@ -2098,43 +2317,68 @@ namespace confighttp {
   }
 
   /**
-   * @brief Record a force-disabled target instance id (idempotent).
+   * @brief Record a blocked target (idempotent by instance id).
    */
-  void add_disabled_target(const std::string &id) {
-    auto ids = read_disabled_targets();
-    if (std::find(ids.begin(), ids.end(), id) == ids.end()) {
-      ids.push_back(id);
-      write_disabled_targets(ids);
+  void add_blocked_target(const blocked_target_t &target) {
+    auto targets = read_blocked_targets();
+    for (const auto &existing : targets) {
+      if (existing.instance_id == target.instance_id) {
+        return;
+      }
     }
+    targets.push_back(target);
+    write_blocked_targets(targets);
   }
 
   /**
-   * @brief Enable a device by instance id (for recorded force-disabled targets).
+   * @brief Restore a recorded blocked target (by instance id + method).
+   * @return True when the target was restored (or re-enumerated via its parent).
    */
-  bool enable_by_instance_id(const std::string &instance_id) {
-    const std::wstring wide(instance_id.begin(), instance_id.end());
+  bool restore_target(const blocked_target_t &target) {
+    std::wstring wide(target.instance_id.begin(), target.instance_id.end());
     DEVINST devinst = 0;
-    if (CM_Locate_DevNodeW(&devinst, const_cast<wchar_t *>(wide.c_str()), CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS) {
-      return false;
+    bool located = CM_Locate_DevNodeW(&devinst, wide.data(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS;
+    if (!located) {
+      located = CM_Locate_DevNodeW(&devinst, wide.data(), CM_LOCATE_DEVNODE_PHANTOM) == CR_SUCCESS;
     }
-    if (CM_Enable_DevNode(devinst, 0) == CR_SUCCESS && !node_is_disabled(devinst)) {
+
+    if (located && restore_node(devinst, target.method == "ejected")) {
       return true;
     }
-    if (setupdi_set_state(devinst, DICS_ENABLE) && !node_is_disabled(devinst)) {
-      return true;
+
+    // Re-enumerate the recorded parent so a removed/ejected child re-attaches.
+    if (!target.parent_id.empty()) {
+      std::wstring wide_parent(target.parent_id.begin(), target.parent_id.end());
+      DEVINST parent = 0;
+      if (CM_Locate_DevNodeW(&parent, wide_parent.data(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS) {
+        CM_Reenumerate_DevNode(parent, CM_REENUMERATE_SYNCHRONOUS);
+        return true;
+      }
     }
-    if (registry_enable(devinst) && !node_is_disabled(devinst)) {
-      return true;
-    }
+
     return false;
   }
 
   /**
-   * @brief Disable a device node: CM API, then Device Manager path, then the forced
-   *        registry disable (which bypasses the DN_DISABLEABLE gate). The registry
-   *        re-enumeration is asynchronous, so we poll after it.
+   * @brief Block a device node.
+   * @details Primary method is eject/remove (a different API family than disable):
+   *          CM_Query_And_Remove_SubTree (problem code 21) then CM_Request_Device_Eject
+   *          (problem code 47). These work on nodes that report CR_NOT_DISABLEABLE.
+   *          Falls back to the legacy disable paths (CM_Disable_DevNode, Device
+   *          Manager DICS_DISABLE, forced CONFIGFLAG_DISABLED).
+   * @return `disabled`, `removed`, `ejected`, `already_blocked`, or `error_<code>`.
    */
   std::string disable_node(DEVINST devinst, const std::string &name) {
+    if (node_is_blocked(devinst)) {
+      return "already_blocked";
+    }
+
+    // Eject/remove first — the disable APIs return CR_NOT_DISABLEABLE on these nodes.
+    const std::string eject = eject_node(devinst, name);
+    if (eject == "removed" || eject == "ejected") {
+      return eject;
+    }
+
     CONFIGRET cr = CM_Disable_DevNode(devinst, CM_DISABLE_UI_NOT_OK);
     if (cr == CR_NOT_DISABLEABLE) {
       cr = CM_Disable_DevNode(devinst, CM_DISABLE_ABSOLUTE | CM_DISABLE_UI_NOT_OK);
@@ -2147,14 +2391,14 @@ namespace confighttp {
       return "disabled";
     }
 
-    if (registry_disable(devinst) && wait_disabled(devinst)) {
+    if (registry_disable(devinst) && wait_blocked(devinst)) {
       return "disabled";
     }
 
     if (input_block_verbose.load()) {
-      BOOST_LOG(warning) << "Input block: could not disable ["sv << static_cast<unsigned long>(cr) << "] "sv << name;
+      BOOST_LOG(warning) << "Input block: could not block ["sv << static_cast<unsigned long>(cr) << "] "sv << name;
     } else {
-      BOOST_LOG(debug) << "Input block: could not disable ["sv << static_cast<unsigned long>(cr) << "] "sv << name;
+      BOOST_LOG(debug) << "Input block: could not block ["sv << static_cast<unsigned long>(cr) << "] "sv << name;
     }
     return std::format("error_{}", static_cast<unsigned long>(cr));
   }
@@ -2165,14 +2409,14 @@ namespace confighttp {
   struct block_outcome_t {
     std::string group_key;   ///< Topmost physical node (for dedup); empty when virtual.
     std::string target_id;   ///< Node actually targeted.
-    std::string result;      ///< `disabled`, `would_disable`, `already_disabled`, `not_disableable`, or `skipped_virtual`.
+    std::string result;      ///< `disabled`, `removed`, `ejected`, `already_blocked`, `would_disable`, `not_disableable`, or `skipped_virtual`.
   };
 
   /**
-   * @brief Disable the physical device owning a HID collection.
+   * @brief Block the physical device owning a HID collection.
    * @details Tries each node in the collection's physical HID/USB chain, from the
    *          topmost (USB composite) down to the collection, until one can be
-   *          disabled. Virtual devices (no USB ancestor) are never touched.
+   *          blocked. Virtual devices (no USB ancestor) are never touched.
    */
   block_outcome_t block_physical_device(DEVINST collection, bool dry_run) {
     const auto chain = build_physical_chain(collection);
@@ -2185,11 +2429,15 @@ namespace confighttp {
     for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
       const std::string id = device_instance_id(*it);
       if (dry_run) {
-        return {group_key, id, node_is_disabled(*it) ? "already_disabled" : "would_disable"};
+        return {group_key, id, node_is_blocked(*it) ? "already_blocked" : "would_disable"};
       }
       const std::string result = disable_node(*it, id);
-      if (result == "disabled") {
-        add_disabled_target(id);
+      if (result == "disabled" || result == "removed" || result == "ejected" || result == "already_blocked") {
+        blocked_target_t target;
+        target.instance_id = id;
+        target.method = result == "already_blocked" ? block_method(*it) : result;
+        target.parent_id = parent_instance_id(*it);
+        add_blocked_target(target);
         return {group_key, id, result};
       }
     }
@@ -2265,22 +2513,24 @@ namespace confighttp {
         results.push_back(std::move(entry));
       }
 
-      // Enable nodes that were force-disabled and recorded — the class scans above can
-      // miss them (e.g. a USB interface node whose class is HIDClass).
-      for (const auto &id : read_disabled_targets()) {
+      // Restore nodes that were blocked and recorded — the class scans above can
+      // miss them (e.g. a USB interface node whose class is HIDClass, or a node
+      // removed/ejected from the bus).
+      for (const auto &target : read_blocked_targets()) {
         nlohmann::json entry;
-        entry["name"] = id;
-        entry["instance_id"] = id;
+        entry["name"] = target.instance_id;
+        entry["instance_id"] = target.instance_id;
+        entry["method"] = target.method;
         if (dry_run) {
           entry["result"] = "would_enable";
         } else {
-          entry["result"] = enable_by_instance_id(id) ? "enabled" : "error_enable";
+          entry["result"] = restore_target(target) ? "enabled" : "error_enable";
         }
         results.push_back(std::move(entry));
       }
 
       if (!dry_run) {
-        write_disabled_targets({});
+        write_blocked_targets({});
       }
     }
 
@@ -2493,23 +2743,23 @@ namespace confighttp {
       input_block_verbose.store(false);
     }
 
-    const int disabled_count = count_results(results, "disabled");
+    const int disabled_count = count_results(results, "disabled") + count_results(results, "removed") + count_results(results, "ejected");
     const int would_count = count_results(results, "would_disable");
-    const int already_disabled_count = count_results(results, "already_disabled");
+    const int already_blocked_count = count_results(results, "already_blocked") + count_results(results, "already_disabled");
     const int skipped_count = count_results(results, "skipped_virtual");
     const int duplicate_count = count_results(results, "duplicate");
 
     output_tree["status"] = true;
     output_tree["dry_run"] = dry_run;
-    output_tree["blocked"] = dry_run ? (would_count + already_disabled_count) > 0 : disabled_count > 0;
+    output_tree["blocked"] = dry_run ? (would_count + already_blocked_count) > 0 : disabled_count > 0;
     output_tree["blocked_count"] = dry_run ? would_count : disabled_count;
     output_tree["skipped_virtual_count"] = skipped_count;
     output_tree["duplicate_count"] = duplicate_count;
     output_tree["devices"] = results;
 
-    if (!dry_run && disabled_count > 0) {
+    if (!dry_run && (disabled_count > 0 || already_blocked_count > 0)) {
       // Watchdog re-applies the block to catch newly plugged physical devices.
-      // Only start it when something was actually disabled (avoids retry/log spam).
+      // Only start it when something is actually blocked (avoids retry/log spam).
       start_input_block_watchdog();
     }
 
