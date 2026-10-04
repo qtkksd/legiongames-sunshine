@@ -1949,6 +1949,19 @@ namespace confighttp {
   std::atomic<bool> input_block_verbose {false};
 
   /**
+   * @brief Re-enumerate a node and its parent synchronously so a registry
+   *        ConfigFlags change actually takes effect (a plain async re-enumerate
+   *        frequently does not — the flag is written but the device stays started).
+   */
+  void reenumerate_node(DEVINST devinst) {
+    CM_Reenumerate_DevNode(devinst, CM_REENUMERATE_SYNCHRONOUS);
+    DEVINST parent = 0;
+    if (CM_Get_Parent(&parent, devinst, 0) == CR_SUCCESS && parent != 0) {
+      CM_Reenumerate_DevNode(parent, CM_REENUMERATE_SYNCHRONOUS);
+    }
+  }
+
+  /**
    * @brief Force-disable a node by setting CONFIGFLAG_DISABLED and re-enumerating.
    * @details Last resort for nodes that refuse CM_Disable_DevNode (CR_NOT_DISABLEABLE).
    */
@@ -1974,7 +1987,7 @@ namespace confighttp {
     }
 
     if (ok) {
-      CM_Reenumerate_DevNode(devinst, 0);
+      reenumerate_node(devinst);
     }
     return ok;
   }
@@ -2001,7 +2014,7 @@ namespace confighttp {
     RegCloseKey(key);
 
     if (ok) {
-      CM_Reenumerate_DevNode(devinst, 0);
+      reenumerate_node(devinst);
     }
     return ok;
   }
