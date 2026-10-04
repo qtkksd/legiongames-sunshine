@@ -1686,6 +1686,12 @@ namespace confighttp {
    * @brief Whether the node is a USB hub or root hub (never disable these).
    */
   bool is_usb_hub(DEVINST devinst) {
+    // Root hubs (USB\ROOT_HUB20 / USB\ROOT_HUB30) do NOT carry a Class_09
+    // compatible id, so match them by instance id too — a root hub must never be
+    // disabled (that would take down every device on the controller).
+    if (device_instance_id(devinst).rfind("USB\\ROOT_HUB", 0) == 0) {
+      return true;
+    }
     for (const auto &compatible_id : device_multi_sz_property(devinst, drp_compatible_ids)) {
       if (compatible_id.find(L"Class_09") != std::wstring::npos) {
         return true;
@@ -1715,10 +1721,13 @@ namespace confighttp {
       }
       const std::string id = device_instance_id(parent);
       if (id.rfind("USB\\", 0) == 0) {
-        physical = true;
-        if (is_usb_hub(parent)) {
-          break;  // don't walk past a hub/root hub
+        // Only physical device/interface nodes (USB\VID_…) are valid targets;
+        // stop at root hubs, hubs and host controllers so a root hub can never
+        // become a target even if the Class_09 hub check misses it.
+        if (id.rfind("USB\\VID_", 0) != 0 || is_usb_hub(parent)) {
+          break;
         }
+        physical = true;
       } else if (id.rfind("HID\\", 0) != 0) {
         break;  // left the HID/USB bus (PS/2, Bluetooth, virtual root, …)
       }
