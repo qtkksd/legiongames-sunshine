@@ -3051,17 +3051,19 @@ namespace confighttp {
 #ifdef _WIN32
     stop_input_block_watchdog();
     input_block_verbose.store(true);
-    nlohmann::json passes;
+    nlohmann::json results;
     {
       std::lock_guard<std::mutex> lock(input_block_mutex);
-      passes = heal_input_devices(15);
+      // Ultimate fix: cascade-heal every present blocked device AND restore recorded
+      // targets (including removed/phantom ones, via their recorded parent).
+      results = apply_input_state(true, false);
     }
     input_block_verbose.store(false);
 
     output_tree["status"] = true;
-    output_tree["passes"] = passes;
+    output_tree["devices"] = results;
 
-    BOOST_LOG(info) << "Input recover: cascade heal complete ("sv << passes.size() << " passes)"sv;
+    BOOST_LOG(info) << "Input recover: full heal + record restore complete"sv;
 #else
     output_tree["status"] = false;
     output_tree["error"] = "Input recovery is only available on Windows";
