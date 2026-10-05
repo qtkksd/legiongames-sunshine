@@ -2814,7 +2814,7 @@ namespace confighttp {
       };
       params.Context = &state_;
 
-      thread_ = std::thread([this, params]() {
+      thread_ = std::thread([this, params]() mutable {
         HANDLE h_console = nullptr;
         HANDLE h_monitor = nullptr;
         if (reg_(&guid_console_display_state, device_notify_callback, &params, &h_console) != ERROR_SUCCESS) {
