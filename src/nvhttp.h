@@ -120,6 +120,13 @@ namespace nvhttp {
      * @brief used as a security measure to prevent out of order calls
      */
     PAIR_PHASE last_phase = PAIR_PHASE::NONE;
+
+    /**
+     * @brief Monotonic creation order. Used to select the newest pending
+     * session when a PIN is inserted, so stale/abandoned sessions cannot
+     * steal the PIN from the client that is currently pairing.
+     */
+    uint32_t seq = 0;
   };
 
   /**

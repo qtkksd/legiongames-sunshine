@@ -734,6 +734,7 @@ namespace nvhttp {
 
         BOOST_LOG(debug) << sess.client.cert;
         auto ptr = map_id_sess.emplace(sess.client.uniqueID, std::move(sess)).first;
+        ptr->second.seq = ++session_id_counter;
 
         ptr->second.async_insert_pin.salt = std::move(get_arg(args, "salt"));
         if (config::sunshine.flags[config::flag::PIN_STDIN]) {
@@ -808,7 +809,16 @@ namespace nvhttp {
       return false;
     }
 
-    auto &sess = std::begin(map_id_sess)->second;
+    // Insert the PIN into the MOST RECENT pairing session (the client that is
+    // currently pairing). Picking std::begin() was arbitrary and let stale,
+    // abandoned sessions steal the PIN, leaving the live client unpaired.
+    auto newest = map_id_sess.begin();
+    for (auto it = map_id_sess.begin(); it != map_id_sess.end(); ++it) {
+      if (it->second.seq > newest->second.seq) {
+        newest = it;
+      }
+    }
+    auto &sess = newest->second;
     getservercert(sess, tree, pin);
     sess.client.name = name;
 
