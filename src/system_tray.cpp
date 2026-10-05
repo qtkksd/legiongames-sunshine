@@ -409,20 +409,14 @@ namespace system_tray {
       return;
     }
 
+    // LegionGames: no Windows notification on incoming pairing requests.
+    // Just refresh the tray icon state (no balloon/toast).
     tray.notification_title = nullptr;
     tray.notification_text = nullptr;
     tray.notification_cb = nullptr;
     tray.notification_icon = nullptr;
     tray.icon = TRAY_ICON;
-    tray_update(&tray);
-    tray.icon = TRAY_ICON;
-    tray.notification_title = "Incoming Pairing Request";
-    tray.notification_text = "Click here to complete the pairing process";
-    tray.notification_icon = TRAY_ICON_LOCKED;
     tray.tooltip = PROJECT_NAME;
-    tray.notification_cb = []() {
-      launch_ui("/pin");
-    };
     tray_update(&tray);
   }
 
