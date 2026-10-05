@@ -2785,6 +2785,7 @@ namespace confighttp {
    */
   int query_display_state() {
     static const GUID guid_console_display_state = {0x6FE69556, 0x704A, 0x47A0, {0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47}};
+    static const GUID guid_monitor_power_on = {0x02731015, 0x4510, 0x4526, {0x99, 0xE6, 0xE5, 0xA1, 0x7E, 0xBD, 0x1A, 0xEA}};
     constexpr DWORD device_notify_callback = 2;
 
     struct power_setting_t {
@@ -2795,6 +2796,10 @@ namespace confighttp {
     struct subscribe_t {
       ULONG(WINAPI *Callback)(PVOID, ULONG, PVOID);
       PVOID Context;
+    };
+    struct probe_ctx_t {
+      int state = -1;
+      int fired = 0;
     };
 
     HMODULE powrprof = LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -2813,23 +2818,51 @@ namespace confighttp {
       return -1;
     }
 
-    int state = -1;
+    probe_ctx_t ctx;
     subscribe_t params {};
     params.Callback = [](PVOID context, ULONG, PVOID setting) -> ULONG {
+      auto *c = static_cast<probe_ctx_t *>(context);
       auto *s = static_cast<power_setting_t *>(setting);
       if (s && s->DataLength >= sizeof(DWORD)) {
-        *static_cast<int *>(context) = static_cast<int>(*reinterpret_cast<DWORD *>(s->Data));
+        c->state = static_cast<int>(*reinterpret_cast<DWORD *>(s->Data));
+        ++c->fired;
       }
       return ERROR_SUCCESS;
     };
-    params.Context = &state;
+    params.Context = &ctx;
 
-    HANDLE handle = nullptr;
-    if (reg(&guid_console_display_state, device_notify_callback, &params, &handle) != ERROR_SUCCESS) {
-      return -1;
-    }
-    unreg(handle);
-    return state;
+    // The notification callback is delivered asynchronously on the registering
+    // thread's message queue, so run this on a dedicated thread that pumps until
+    // the initial callback arrives (otherwise unregistering immediately means it
+    // never fires and the state stays unknown).
+    std::thread([&]() {
+      HANDLE h_console = nullptr;
+      HANDLE h_monitor = nullptr;
+      if (reg(&guid_console_display_state, device_notify_callback, &params, &h_console) != ERROR_SUCCESS) {
+        h_console = nullptr;
+      }
+      if (reg(&guid_monitor_power_on, device_notify_callback, &params, &h_monitor) != ERROR_SUCCESS) {
+        h_monitor = nullptr;
+      }
+
+      for (int i = 0; i < 30 && ctx.fired == 0; ++i) {
+        MSG msg;
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, 50, QS_ALLINPUT);
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+          TranslateMessage(&msg);
+          DispatchMessageW(&msg);
+        }
+      }
+
+      if (h_console) {
+        unreg(h_console);
+      }
+      if (h_monitor) {
+        unreg(h_monitor);
+      }
+    }).join();
+
+    return ctx.fired > 0 ? ctx.state : -1;
   }
 
   /**
