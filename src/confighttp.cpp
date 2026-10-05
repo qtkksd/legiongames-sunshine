@@ -2778,155 +2778,20 @@ namespace confighttp {
   }
 
   /**
-   * @brief Subscribes to the OS display-state power settings and tracks the latest value.
-   * @details Registers GUID_CONSOLE_DISPLAY_STATE + GUID_MONITOR_POWER_ON on a dedicated
-   *          thread that pumps its message queue (that's where the notification callback
-   *          is delivered). Create it BEFORE toggling the display so no transition is
-   *          missed. Reports the OS display-stack state (0 = off, 1 = on, 2 = dimmed).
-   */
-  class display_watch_t {
-  public:
-    display_watch_t() {
-      static const GUID guid_console_display_state = {0x6FE69556, 0x704A, 0x47A0, {0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47}};
-      static const GUID guid_monitor_power_on = {0x02731015, 0x4510, 0x4526, {0x99, 0xE6, 0xE5, 0xA1, 0x7E, 0xBD, 0x1A, 0xEA}};
-      constexpr DWORD device_notify_callback = 2;
-
-      powrprof_ = LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-      if (!powrprof_) {
-        return;
-      }
-      reg_ = reinterpret_cast<register_fn_t>(GetProcAddress(powrprof_, "PowerSettingRegisterNotification"));
-      unreg_ = reinterpret_cast<unregister_fn_t>(GetProcAddress(powrprof_, "PowerSettingUnregisterNotification"));
-      if (!reg_ || !unreg_) {
-        FreeLibrary(powrprof_);
-        powrprof_ = nullptr;
-        return;
-      }
-
-      subscribe_t params {};
-      params.Callback = [](PVOID context, ULONG, PVOID setting) -> ULONG {
-        auto *s = static_cast<power_setting_t *>(setting);
-        auto *state = static_cast<std::atomic<int> *>(context);
-        if (s && s->DataLength >= sizeof(DWORD)) {
-          state->store(static_cast<int>(*reinterpret_cast<DWORD *>(s->Data)));
-        }
-        return ERROR_SUCCESS;
-      };
-      params.Context = &state_;
-
-      thread_ = std::thread([this, params]() mutable {
-        HANDLE h_console = nullptr;
-        HANDLE h_monitor = nullptr;
-        if (reg_(&guid_console_display_state, device_notify_callback, &params, &h_console) != ERROR_SUCCESS) {
-          h_console = nullptr;
-        }
-        if (reg_(&guid_monitor_power_on, device_notify_callback, &params, &h_monitor) != ERROR_SUCCESS) {
-          h_monitor = nullptr;
-        }
-
-        while (!stop_.load()) {
-          MSG msg;
-          MsgWaitForMultipleObjects(0, nullptr, FALSE, 50, QS_ALLINPUT);
-          while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-          }
-        }
-
-        if (h_console) {
-          unreg_(h_console);
-        }
-        if (h_monitor) {
-          unreg_(h_monitor);
-        }
-      });
-    }
-
-    ~display_watch_t() {
-      stop_.store(true);
-      if (thread_.joinable()) {
-        thread_.join();
-      }
-      if (powrprof_) {
-        FreeLibrary(powrprof_);
-      }
-    }
-
-    /** @brief Latest observed display state (-1 = unknown / not yet reported). */
-    int state() const {
-      return state_.load();
-    }
-
-    /**
-     * @brief Wait for the display to settle ON (value 1).
-     * @details Waits up to @p max_wait; if the probe never reports anything it gives
-     *          up after @p probe_grace (the API itself is unavailable). Gating on the
-     *          exact value 1 avoids latching a transitional/dim value (2).
-     */
-    bool wait_for_on(std::chrono::milliseconds max_wait, std::chrono::milliseconds probe_grace) {
-      const auto start = std::chrono::steady_clock::now();
-      bool probe_seen = false;
-      while (std::chrono::steady_clock::now() - start < max_wait) {
-        const int current = state_.load();
-        if (current == 1) {
-          return true;
-        }
-        if (current >= 0) {
-          probe_seen = true;
-        }
-        if (!probe_seen && std::chrono::steady_clock::now() - start >= probe_grace) {
-          break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      }
-      return state_.load() == 1;
-    }
-
-  private:
-    using register_fn_t = DWORD(WINAPI *)(const GUID *, DWORD, PVOID, HANDLE *);
-    using unregister_fn_t = DWORD(WINAPI *)(HANDLE);
-
-    struct power_setting_t {
-      GUID PowerSetting;
-      DWORD DataLength;
-      UCHAR Data[1];
-    };
-    struct subscribe_t {
-      ULONG(WINAPI *Callback)(PVOID, ULONG, PVOID);
-      PVOID Context;
-    };
-
-    HMODULE powrprof_ = nullptr;
-    register_fn_t reg_ = nullptr;
-    unregister_fn_t unreg_ = nullptr;
-    std::atomic<int> state_ {-1};
-    std::atomic<bool> stop_ {false};
-    std::thread thread_;
-  };
-
-  /**
-   * @brief Wake the physical display(s): ES_DISPLAY_REQUIRED, then imitated input.
-   * @details Subscribes to the display-state notification BEFORE toggling (so no
-   *          transition is missed), toggles, then waits for the state to settle ON.
-   *          Only when it does not settle ON do we inject a synthetic mouse move.
-   * @return True when a wake method reported success.
+   * @brief Wake the physical display(s).
+   * @details Tries ES_DISPLAY_REQUIRED + SC_MONITORPOWER -1, then ALWAYS injects a
+   *          small synthetic mouse move (1px and back, net-zero cursor). The OS
+   *          display-stack state cannot be trusted to reflect the physical panel
+   *          (it can report ON while the panel is still dark), so the input nudge is
+   *          unconditional and is what actually wakes the panel.
+   * @return True when the synthetic input was sent.
    */
   bool wake_display() {
     platf::syncThreadDesktop();
 
-    display_watch_t watch;
-
     SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
     set_monitor_power(false);
-
-    // Wait up to 5s for a settled "on"; give up after 1.5s if the probe never reports.
-    const bool settled_on = watch.wait_for_on(std::chrono::seconds(5), std::chrono::milliseconds(1500));
     SetThreadExecutionState(ES_CONTINUOUS);
-
-    if (settled_on) {
-      BOOST_LOG(info) << "Monitor on: woke via ES_DISPLAY_REQUIRED (display state=on)"sv;
-      return true;
-    }
 
     // Idempotent nudge: 1px and back (net-zero cursor) to wake DPMS.
     INPUT inputs[2] {};
@@ -2940,7 +2805,7 @@ namespace confighttp {
     inputs[1].mi.dwFlags = MOUSEEVENTF_MOVE;
     const UINT sent = SendInput(2, inputs, sizeof(INPUT));
 
-    BOOST_LOG(info) << "Monitor on: ES_DISPLAY_REQUIRED did not settle on (last display state="sv << watch.state() << ") -> woke via synthetic input (sent="sv << sent << ")"sv;
+    BOOST_LOG(info) << "Monitor on: woke via ES_DISPLAY_REQUIRED + synthetic input (sent="sv << sent << ")"sv;
     return sent == 2;
   }
 
