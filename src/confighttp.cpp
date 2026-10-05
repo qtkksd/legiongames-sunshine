@@ -3565,7 +3565,7 @@ namespace confighttp {
       const std::string launcher_content = std::format(
         "@echo off\r\n"
         "ping -n 21 127.0.0.1 >nul\r\n"
-        "\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File \"{}\" -State \"{}\"\r\n",
+        "\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File \"{}\" -StatePath \"{}\"\r\n",
         config_script.string(), upgrade_state_path().string());
       file_handler::write_file(launcher.string().c_str(), launcher_content);
 

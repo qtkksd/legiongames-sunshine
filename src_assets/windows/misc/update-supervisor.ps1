@@ -17,11 +17,14 @@
 
 .NOTES
   Must run elevated (SYSTEM). Uses only built-in Windows components.
+  NOTE: the state path parameter is deliberately named $StatePath, not $State, so it
+  cannot collide with the parsed $info object (PowerShell variable names are
+  case-insensitive, which previously made $state overwrite the path).
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $false)]
-    [string]$State,
+    [string]$StatePath,
 
     [Parameter(Mandatory = $false)]
     [string]$Log,
@@ -41,11 +44,11 @@ $ErrorActionPreference = 'Continue'
 $ServiceName = 'SunshineService'
 $TaskName = 'SunshineUpdateVerify'
 
-if (-not $State) {
-    $State = Join-Path $PSScriptRoot '..\config\upgrade_state.json'
+if (-not $StatePath) {
+    $StatePath = Join-Path $PSScriptRoot '..\config\upgrade_state.json'
 }
 if (-not $Log) {
-    $Log = Join-Path (Split-Path -Parent $State) 'update-supervisor.log'
+    $Log = Join-Path (Split-Path -Parent $StatePath) 'update-supervisor.log'
 }
 
 # Accept the self-signed Sunshine HTTPS certificate for the loopback health probe.
@@ -60,16 +63,23 @@ function Write-Log {
 }
 
 function Read-State {
-    if (-not (Test-Path -LiteralPath $State)) { return $null }
-    try { return (Get-Content -LiteralPath $State -Raw | ConvertFrom-Json) } catch { return $null }
+    if (-not (Test-Path -LiteralPath $StatePath)) { return $null }
+    try {
+        $raw = Get-Content -LiteralPath $StatePath -Raw
+        Write-Log "State raw ($($raw.Length) chars): $raw"
+        return ($raw | ConvertFrom-Json)
+    } catch {
+        Write-Log "State parse failed: $($_.Exception.Message)"
+        return $null
+    }
 }
 
 function Write-State {
-    param($StateObj)
+    param($Info)
     try {
-        $json = $StateObj | ConvertTo-Json -Depth 5
+        $json = $Info | ConvertTo-Json -Depth 5
         # Write without a BOM so the C++ side (nlohmann::json) can parse it.
-        [System.IO.File]::WriteAllText($State, $json, (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText($StatePath, $json, (New-Object System.Text.UTF8Encoding($false)))
     } catch {
         Write-Log "Failed to write state: $($_.Exception.Message)"
     }
@@ -117,31 +127,31 @@ function Prune-Backups {
 }
 
 # --- main ---
-Write-Log "Supervisor started (state=$State)"
+Write-Log "Supervisor started (state=$StatePath)"
 
-$state = Read-State
-if (-not $state) {
+$info = Read-State
+if (-not $info) {
     Write-Log "No upgrade state found; nothing to do."
     Remove-Task
     exit 0
 }
 
-if ($state.phase -in @('success', 'rolled_back', 'rollback_failed')) {
-    Write-Log "State already terminal (phase=$($state.phase)); nothing to do."
+if ($info.phase -in @('success', 'rolled_back', 'rollback_failed')) {
+    Write-Log "State already terminal (phase=$($info.phase)); nothing to do."
     Remove-Task
     exit 0
 }
 
-$port = [int]$state.port
-$toCommit = [string]$state.to_commit
-$fromCommit = [string]$state.from_commit
-$installDir = [string]$state.install_dir
-$backupDir = [string]$state.backup_dir
+$port = [int]$info.port
+$toCommit = [string]$info.to_commit
+$fromCommit = [string]$info.from_commit
+$installDir = [string]$info.install_dir
+$backupDir = [string]$info.backup_dir
 
-Write-Log "Verifying new build $toCommit on port $port (rollback -> $fromCommit)"
+Write-Log "Verifying new build '$toCommit' on port $port (rollback -> '$fromCommit')"
 
-$state.phase = 'verifying'
-Write-State $state
+$info.phase = 'verifying'
+Write-State $info
 
 # 1. Wait for the new build to report the expected commit.
 $stable = 0
@@ -158,8 +168,8 @@ while ((Get-Date) -lt $deadline) {
 
 if ($stable -ge $StableCount) {
     Write-Log "New build is online (commit $toCommit). Update successful."
-    $state.phase = 'success'
-    Write-State $state
+    $info.phase = 'success'
+    Write-State $info
     Prune-Backups -RollbackRoot (Split-Path -Parent $backupDir)
     Remove-Task
     exit 0
@@ -167,8 +177,8 @@ if ($stable -ge $StableCount) {
 
 # 2. New build never came online: roll back to the previous version.
 Write-Log "New build did not come online within ${TimeoutSec}s. Rolling back to $fromCommit."
-$state.phase = 'rolling_back'
-Write-State $state
+$info.phase = 'rolling_back'
+Write-State $info
 
 try {
     Write-Log "Stopping $ServiceName"
@@ -206,11 +216,11 @@ while ((Get-Date) -lt $deadline) {
 
 if ($ok) {
     Write-Log "Rollback complete; service is online on the previous version."
-    $state.phase = 'rolled_back'
+    $info.phase = 'rolled_back'
 } else {
     Write-Log "Rollback attempted but the service did not come online."
-    $state.phase = 'rollback_failed'
+    $info.phase = 'rollback_failed'
 }
-Write-State $state
+Write-State $info
 Remove-Task
 exit 0
