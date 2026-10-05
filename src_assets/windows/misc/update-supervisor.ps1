@@ -85,14 +85,28 @@ function Write-State {
     }
 }
 
+$script:healthFailLogged = $false
+
 function Test-Health {
     param([int]$Port, [string]$ExpectCommit)
+    # curl.exe is used instead of Invoke-RestMethod: Windows PowerShell 5.1's .NET
+    # Framework TLS stack fails the handshake with Sunshine's OpenSSL HTTPS
+    # ("The underlying connection was closed: An unexpected error occurred on a send").
     try {
-        $r = Invoke-RestMethod -Uri "https://127.0.0.1:$Port/api/health" -TimeoutSec 5 -ErrorAction Stop
-        if ($r.status -ne 'ok') { return $false }
-        if ($ExpectCommit -and ($r.commit -ne $ExpectCommit)) { return $false }
-        return $true
+        $out = & "$env:SystemRoot\System32\curl.exe" -k -s --max-time 5 "https://127.0.0.1:$Port/api/health" 2>$null
+        $r = $null
+        try { $r = $out | ConvertFrom-Json } catch {}
+        $ok = ($null -ne $r -and $r.status -eq 'ok' -and ((-not $ExpectCommit) -or ($r.commit -eq $ExpectCommit)))
+        if (-not $ok -and -not $script:healthFailLogged) {
+            Write-Log "Health probe not ready yet: '$out'"
+            $script:healthFailLogged = $true
+        }
+        return $ok
     } catch {
+        if (-not $script:healthFailLogged) {
+            Write-Log "Health probe error: $($_.Exception.Message)"
+            $script:healthFailLogged = $true
+        }
         return $false
     }
 }
