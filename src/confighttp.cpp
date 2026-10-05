@@ -6,6 +6,16 @@
  */
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
+// CM_Register_Notification and related types require Windows 8+ SDK headers.
+#ifdef _WIN32
+  #ifndef _WIN32_WINNT
+    #define _WIN32_WINNT 0x0A00
+  #endif
+  #ifndef WINVER
+    #define WINVER 0x0A00
+  #endif
+#endif
+
 // standard includes
 #include <algorithm>
 #include <filesystem>
@@ -2768,6 +2778,102 @@ namespace confighttp {
   }
 
   /**
+   * @brief Query the console display state (0 = off, 1 = on, 2 = dimmed); -1 when unknown.
+   * @details Uses the GUID_CONSOLE_DISPLAY_STATE power setting via a one-shot
+   *          notification callback (dynamically loaded from powrprof.dll), because
+   *          SetThreadExecutionState reports call success, not whether the panel woke.
+   */
+  int query_display_state() {
+    static const GUID guid_console_display_state = {0x6FE69556, 0x704A, 0x47A0, {0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47}};
+    constexpr DWORD device_notify_callback = 2;
+
+    struct power_setting_t {
+      GUID PowerSetting;
+      DWORD DataLength;
+      UCHAR Data[1];
+    };
+    struct subscribe_t {
+      ULONG(WINAPI *Callback)(PVOID, ULONG, PVOID);
+      PVOID Context;
+    };
+
+    HMODULE powrprof = LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!powrprof) {
+      return -1;
+    }
+    auto close = util::fail_guard([powrprof]() {
+      FreeLibrary(powrprof);
+    });
+
+    using register_fn_t = DWORD(WINAPI *)(const GUID *, DWORD, PVOID, HANDLE *);
+    using unregister_fn_t = DWORD(WINAPI *)(HANDLE);
+    auto reg = reinterpret_cast<register_fn_t>(GetProcAddress(powrprof, "PowerSettingRegisterNotification"));
+    auto unreg = reinterpret_cast<unregister_fn_t>(GetProcAddress(powrprof, "PowerSettingUnregisterNotification"));
+    if (!reg || !unreg) {
+      return -1;
+    }
+
+    int state = -1;
+    subscribe_t params {};
+    params.Callback = [](PVOID context, ULONG, PVOID setting) -> ULONG {
+      auto *s = static_cast<power_setting_t *>(setting);
+      if (s && s->DataLength >= sizeof(DWORD)) {
+        *static_cast<int *>(context) = static_cast<int>(*reinterpret_cast<DWORD *>(s->Data));
+      }
+      return ERROR_SUCCESS;
+    };
+    params.Context = &state;
+
+    HANDLE handle = nullptr;
+    if (reg(&guid_console_display_state, device_notify_callback, &params, &handle) != ERROR_SUCCESS) {
+      return -1;
+    }
+    unreg(handle);
+    return state;
+  }
+
+  /**
+   * @brief Wake the physical display(s): ES_DISPLAY_REQUIRED, then imitated input.
+   * @details SetThreadExecutionState can report success while the panel stays off,
+   *          so we probe GUID_CONSOLE_DISPLAY_STATE and fall back to a synthetic
+   *          mouse move when the display is still off (or the probe is unavailable).
+   * @return True when a wake method reported success.
+   */
+  bool wake_display() {
+    platf::syncThreadDesktop();
+
+    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
+    set_monitor_power(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    const int state = query_display_state();
+    SetThreadExecutionState(ES_CONTINUOUS);
+
+    if (state == 1) {
+      BOOST_LOG(info) << "Monitor on: woke via ES_DISPLAY_REQUIRED (display state=on)"sv;
+      return true;
+    }
+
+    // Imitate a tiny mouse move and back (net-zero cursor) to wake DPMS.
+    INPUT inputs[2] {};
+    inputs[0].type = INPUT_MOUSE;
+    inputs[0].mi.dx = 1;
+    inputs[0].mi.dy = 0;
+    inputs[0].mi.dwFlags = MOUSEEVENTF_MOVE;
+    inputs[1].type = INPUT_MOUSE;
+    inputs[1].mi.dx = -1;
+    inputs[1].mi.dy = 0;
+    inputs[1].mi.dwFlags = MOUSEEVENTF_MOVE;
+    const UINT sent = SendInput(2, inputs, sizeof(INPUT));
+
+    if (state < 0) {
+      BOOST_LOG(info) << "Monitor on: display-state probe unavailable -> used synthetic input (sent="sv << sent << ")"sv;
+    } else {
+      BOOST_LOG(info) << "Monitor on: ES_DISPLAY_REQUIRED insufficient (display state="sv << state << ") -> woke via synthetic input"sv;
+    }
+    return sent == 2;
+  }
+
+  /**
    * @brief Keep the physical display in standby while remote input keeps waking it.
    * @details Re-asserts the power-off command every 20 seconds until @ref monitor_off_active is cleared.
    */
@@ -2791,10 +2897,38 @@ namespace confighttp {
   /** @brief Background thread that re-blocks newly plugged physical input. */
   std::jthread input_block_watchdog;
 
+  /** @brief Set by the CM notification callback when a device interface arrives. */
+  std::atomic<bool> input_block_arrival_pending {false};
+
   /**
-   * @brief Periodically re-apply the physical-input block while active.
+   * @brief CM device-interface arrival callback (delivered on the watchdog thread).
    */
-  void input_block_watchdog_loop(std::stop_token stop_token) {
+  DWORD CALLBACK input_block_notify_callback(HCMNOTIFICATION, PVOID context, CM_NOTIFY_ACTION action, PCM_NOTIFY_EVENT_DATA, DWORD) {
+    if (action == CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL) {
+      static_cast<std::atomic<bool> *>(context)->store(true);
+    }
+    return ERROR_SUCCESS;
+  }
+
+  /** @brief Re-apply the block after an arrival event and log what it caught. */
+  void input_block_reapply_after_event() {
+    std::lock_guard<std::mutex> lock(input_block_mutex);
+    if (!input_block_active.load()) {
+      return;
+    }
+    const auto results = apply_input_state(false, false);
+    int blocked = 0;
+    for (const auto &entry : results) {
+      const auto r = entry.value("result", std::string {});
+      if (r == "disabled" || r == "removed" || r == "ejected") {
+        ++blocked;
+      }
+    }
+    BOOST_LOG(info) << "Input block: re-blocked "sv << blocked << " device(s) after arrival event"sv;
+  }
+
+  /** @brief 5s poll fallback used when event notifications are unavailable. */
+  void input_block_poll_loop(std::stop_token stop_token) {
     using namespace std::chrono_literals;
     while (!stop_token.stop_requested()) {
       for (int tick = 0; tick < 50 && !stop_token.stop_requested(); ++tick) {
@@ -2808,6 +2942,73 @@ namespace confighttp {
         break;
       }
       apply_input_state(false, false);
+    }
+  }
+
+  /**
+   * @brief Re-apply the block on device-arrival notifications, with a poll fallback.
+   * @details Registers CM notifications for HID and USB device interfaces and pumps
+   *          the thread message queue (required for delivery). On arrival it
+   *          debounces briefly, then re-applies the block. Falls back to a 5s poll
+   *          when registration is unavailable.
+   */
+  void input_block_watchdog_loop(std::stop_token stop_token) {
+    using namespace std::chrono_literals;
+
+    constexpr GUID guid_devinterface_hid = {0x4D1E55B2, 0xF16F, 0x11CF, {0x88, 0xCB, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30}};
+    constexpr GUID guid_devinterface_usb_device = {0xA5DCBF10, 0x6530, 0x11D2, {0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED}};
+
+    CM_NOTIFY_FILTER filters[2] = {};
+    filters[0].cbSize = sizeof(CM_NOTIFY_FILTER);
+    filters[0].FilterType = CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE;
+    filters[0].u.DeviceInterface.ClassGuid = guid_devinterface_hid;
+    filters[1] = filters[0];
+    filters[1].u.DeviceInterface.ClassGuid = guid_devinterface_usb_device;
+
+    HCMNOTIFICATION handles[2] = {};
+    int registered = 0;
+    for (int i = 0; i < 2; ++i) {
+      if (CM_Register_Notification(&filters[i], &input_block_arrival_pending, &input_block_notify_callback, &handles[i]) == CR_SUCCESS) {
+        ++registered;
+      }
+    }
+
+    if (registered == 0) {
+      BOOST_LOG(warning) << "Input block: event watchdog unavailable -> using 5s poll fallback"sv;
+      input_block_poll_loop(stop_token);
+      return;
+    }
+
+    BOOST_LOG(info) << "Input block: event watchdog active (device-arrival notifications)"sv;
+
+    while (!stop_token.stop_requested()) {
+      // Pump the message queue so CM can deliver notifications.
+      MSG msg;
+      MsgWaitForMultipleObjects(0, nullptr, FALSE, 200, QS_ALLINPUT);
+      while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+      }
+
+      if (input_block_arrival_pending.exchange(false)) {
+        // Debounce: let the device finish arriving before we act.
+        for (int tick = 0; tick < 10 && !stop_token.stop_requested(); ++tick) {
+          std::this_thread::sleep_for(100ms);
+        }
+        if (stop_token.stop_requested()) {
+          break;
+        }
+        input_block_reapply_after_event();
+        if (!input_block_active.load()) {
+          break;
+        }
+      }
+    }
+
+    for (int i = 0; i < 2; ++i) {
+      if (handles[i]) {
+        CM_Unregister_Notification(handles[i]);
+      }
     }
   }
 
@@ -2833,6 +3034,7 @@ namespace confighttp {
     }
     std::lock_guard<std::mutex> lock(input_block_watchdog_mutex);
     input_block_active.store(true);
+    input_block_arrival_pending.store(false);
     input_block_watchdog = std::jthread(input_block_watchdog_loop);
   }
 
@@ -2861,7 +3063,7 @@ namespace confighttp {
   void restore_input_state() {
     stop_input_block_watchdog();
     monitor_off_active.store(false);
-    set_monitor_power(false);
+    wake_display();
     {
       std::lock_guard<std::mutex> lock(input_block_mutex);
       apply_input_state(true, false);
@@ -3201,12 +3403,12 @@ namespace confighttp {
 
 #ifdef _WIN32
     monitor_off_active.store(false);
-    const bool delivered = set_monitor_power(false);
+    const bool delivered = wake_display();
 
     output_tree["status"] = delivered;
     output_tree["monitor_off"] = false;
     if (!delivered) {
-      output_tree["error"] = "Failed to deliver display power command";
+      output_tree["error"] = "Failed to wake display";
     }
 #else
     output_tree["status"] = false;
