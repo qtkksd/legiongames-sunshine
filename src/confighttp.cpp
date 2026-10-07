@@ -3548,6 +3548,14 @@ namespace confighttp {
     std::string upgrade_last_error;
     std::string upgrade_latest_version;
     const std::string upgrade_current_version = PROJECT_VERSION_COMMIT;
+    // Monotonic build number (Jenkins BUILD_NUMBER) baked at configure time; 0 when unknown.
+    const int upgrade_current_build = []() {
+      try {
+        return std::stoi(PROJECT_VERSION_BUILD);
+      } catch (...) {
+        return 0;
+      }
+    }();
 
     std::atomic<bool> netbird_update_in_progress {false};
     std::string netbird_update_error;
@@ -3582,6 +3590,23 @@ namespace confighttp {
 
       curl_easy_cleanup(curl);
       return (res == CURLE_OK) ? result : "";
+    }
+
+    /** @brief Lowercase hex SHA-256 of a file (empty string on read failure). */
+    std::string sha256_hex_of_file(const std::filesystem::path &path) {
+      const std::string data = file_handler::read_file(path.string().c_str());
+      if (data.empty()) {
+        return "";
+      }
+      const auto digest = crypto::hash(data);
+      static constexpr char hexd[] = "0123456789abcdef";
+      std::string out;
+      out.reserve(digest.size() * 2);
+      for (const auto byte : digest) {
+        out.push_back(hexd[byte >> 4]);
+        out.push_back(hexd[byte & 0x0F]);
+      }
+      return out;
     }
 
 #ifdef _WIN32
@@ -3740,83 +3765,69 @@ namespace confighttp {
         upgrade_latest_version.clear();
       }
 
-      BOOST_LOG(info) << "Upgrade: checking for new release..."sv;
+      BOOST_LOG(info) << "Upgrade: checking pkgs manifest..."sv;
 
-      // 1. Fetch latest release info
-      std::string release_json = fetch_url(
-        "https://api.github.com/repos/qtkksd/legiongames-sunshine/releases/latest"
+      // 1. Fetch the pkgs manifest (single source of truth for version + asset).
+      std::string manifest_json = fetch_url(
+        "https://pkgs.legiongames.ru/sunshine/latest/manifest.json"
       );
 
-      if (release_json.empty()) {
+      if (manifest_json.empty()) {
         std::lock_guard<std::mutex> lock(upgrade_mutex);
-        upgrade_last_error = "Failed to fetch release information from GitHub";
+        upgrade_last_error = "Failed to fetch pkgs manifest";
         upgrade_in_progress.store(false);
         return;
       }
 
-      nlohmann::json release;
+      nlohmann::json manifest;
       try {
-        release = nlohmann::json::parse(release_json);
+        manifest = nlohmann::json::parse(manifest_json);
       } catch (...) {
         std::lock_guard<std::mutex> lock(upgrade_mutex);
-        upgrade_last_error = "Failed to parse release JSON";
+        upgrade_last_error = "Failed to parse manifest JSON";
         upgrade_in_progress.store(false);
         return;
       }
 
-      std::string tag_name = release.value("tag_name", "");
-      if (tag_name.empty()) {
-        std::lock_guard<std::mutex> lock(upgrade_mutex);
-        upgrade_last_error = "Release JSON missing tag_name";
-        upgrade_in_progress.store(false);
-        return;
-      }
+      const int latest_build = manifest.value("build", 0);
+      const std::string latest_commit = manifest.value("commit_full", manifest.value("commit", std::string {}));
+      const std::string latest_version = manifest.value("version", std::string {});
 
       std::string asset_url;
-      if (release.contains("assets") && release["assets"].is_array()) {
-        for (const auto &asset : release["assets"]) {
-          if (asset.value("name", "") == "Sunshine-Windows-AMD64-installer.exe") {
-            asset_url = asset.value("browser_download_url", "");
-            break;
-          }
-        }
+      std::string asset_sha256;
+      if (manifest.contains("assets") && manifest["assets"].contains("windows")) {
+        const auto &win = manifest["assets"]["windows"];
+        asset_url = win.value("url", "");
+        asset_sha256 = win.value("sha256", "");
       }
 
       if (asset_url.empty()) {
         std::lock_guard<std::mutex> lock(upgrade_mutex);
-        upgrade_last_error = "Installer asset not found in release";
+        upgrade_last_error = "Manifest missing windows asset url";
         upgrade_in_progress.store(false);
         return;
       }
 
-      // 2. Fetch tag commit SHA
-      std::string tag_ref_json = fetch_url(
-        "https://api.github.com/repos/qtkksd/legiongames-sunshine/git/ref/tags/" + tag_name
-      );
-
-      std::string latest_commit;
-      if (!tag_ref_json.empty()) {
-        try {
-          nlohmann::json tag_ref = nlohmann::json::parse(tag_ref_json);
-          if (tag_ref.contains("object") && tag_ref["object"].contains("sha")) {
-            latest_commit = tag_ref["object"]["sha"].get<std::string>();
-          }
-        } catch (...) {
-          BOOST_LOG(warning) << "Upgrade: failed to parse tag reference JSON"sv;
-        }
-      }
-
       {
         std::lock_guard<std::mutex> lock(upgrade_mutex);
-        upgrade_latest_version = latest_commit.empty() ? tag_name : latest_commit;
+        upgrade_latest_version = !latest_version.empty() ? latest_version
+                                   : (!latest_commit.empty() ? latest_commit : std::to_string(latest_build));
       }
 
-      // 3. Compare with current version
-      if (!force && !latest_commit.empty() && latest_commit == upgrade_current_version) {
+      // 2. Compare: prefer the monotonic build number, fall back to the commit.
+      bool outdated;
+      if (latest_build > 0 && upgrade_current_build > 0) {
+        outdated = latest_build > upgrade_current_build;
+      } else {
+        outdated = !latest_commit.empty() && latest_commit != upgrade_current_version;
+      }
+
+      if (!force && !outdated) {
         std::lock_guard<std::mutex> lock(upgrade_mutex);
         upgrade_last_error = "";
         upgrade_in_progress.store(false);
-        BOOST_LOG(info) << "Upgrade: already up to date (commit "sv << latest_commit << ")"sv;
+        BOOST_LOG(info) << "Upgrade: already up to date (build "sv << upgrade_current_build
+                        << ", latest "sv << latest_build << ")"sv;
         return;
       }
 
@@ -3824,7 +3835,7 @@ namespace confighttp {
         BOOST_LOG(info) << "Upgrade: force flag set, skipping version check"sv;
       }
 
-      BOOST_LOG(info) << "Upgrade: new version available, downloading installer..."sv;
+      BOOST_LOG(info) << "Upgrade: new version available (build "sv << latest_build << "), downloading installer..."sv;
 
       // 4. Download installer
       std::error_code temp_ec;
@@ -3845,6 +3856,22 @@ namespace confighttp {
         upgrade_last_error = "Failed to download installer";
         upgrade_in_progress.store(false);
         return;
+      }
+
+      // Verify integrity against the manifest's sha256 (when provided).
+      if (!asset_sha256.empty()) {
+        const std::string actual_sha256 = sha256_hex_of_file(installer_path);
+        if (actual_sha256 != asset_sha256) {
+          std::error_code rm_ec;
+          std::filesystem::remove(installer_path, rm_ec);
+          std::lock_guard<std::mutex> lock(upgrade_mutex);
+          upgrade_last_error = "Downloaded installer failed sha256 verification";
+          upgrade_in_progress.store(false);
+          BOOST_LOG(error) << "Upgrade: sha256 mismatch (expected "sv << asset_sha256
+                           << ", got "sv << actual_sha256 << ")"sv;
+          return;
+        }
+        BOOST_LOG(info) << "Upgrade: installer sha256 verified"sv;
       }
 
       BOOST_LOG(info) << "Upgrade: installer downloaded (rollback_on_failure="sv << rollback_on_failure << "), running silent install..."sv;

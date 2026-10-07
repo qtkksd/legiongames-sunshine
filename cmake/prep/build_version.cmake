@@ -16,6 +16,14 @@ if(DEFINED ENV{TAG})
     set(GITHUB_TAG $ENV{TAG})
 endif()
 
+# Monotonic build number used for update ordering (set by the CI/Jenkins build).
+# The pkgs manifest publishes the same value as "build"; clients update iff
+# remote build > local build.
+set(PROJECT_VERSION_BUILD "0")
+if(DEFINED ENV{BUILD_NUMBER})
+    set(PROJECT_VERSION_BUILD $ENV{BUILD_NUMBER})
+endif()
+
 # Check if env vars are defined before attempting to access them, variables will be defined even if blank
 if((DEFINED ENV{BRANCH}) AND (DEFINED ENV{BUILD_VERSION}))  # cmake-lint: disable=W0106
     if((DEFINED ENV{BRANCH}) AND (NOT $ENV{BUILD_VERSION} STREQUAL ""))
@@ -150,3 +158,4 @@ list(APPEND SUNSHINE_DEFINITIONS PROJECT_VERSION_MAJOR="${PROJECT_VERSION_MAJOR}
 list(APPEND SUNSHINE_DEFINITIONS PROJECT_VERSION_MINOR="${PROJECT_VERSION_MINOR}")
 list(APPEND SUNSHINE_DEFINITIONS PROJECT_VERSION_PATCH="${PROJECT_VERSION_PATCH}")
 list(APPEND SUNSHINE_DEFINITIONS PROJECT_VERSION_COMMIT="${GITHUB_COMMIT}")
+list(APPEND SUNSHINE_DEFINITIONS PROJECT_VERSION_BUILD="${PROJECT_VERSION_BUILD}")
