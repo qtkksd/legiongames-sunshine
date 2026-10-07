@@ -4,34 +4,26 @@ pipeline {
   triggers { pollSCM('H/2 * * * *') }
   stages {
     stage('Checkout') {
-      steps {
-        checkout scm
-        script {
-          def BASH = 'C:\\msys64\\usr\\bin\\bash.exe'
-          env.GIT_SHA  = env.GIT_COMMIT.take(7)
-          env.GIT_SHA_FULL = env.GIT_COMMIT
-          bat(script: "${BASH} -c \"git fetch --tags --force >/dev/null 2>&1 || true\"", returnStatus: true)
-          env.GIT_TAG   = bat(script: "${BASH} -c \"git describe --tags --abbrev=0 2>/dev/null || true\"", returnStdout: true).trim()
-          env.GIT_EXACT = bat(script: "${BASH} -c \"git describe --tags --exact-match 2>/dev/null || true\"", returnStdout: true).trim()
-          env.GIT_DESC  = bat(script: "${BASH} -c \"git describe --tags --always\"", returnStdout: true).trim()
-        }
-      }
+      steps { checkout scm }
     }
     stage('Build (MSYS2 UCRT64)') {
       steps {
-        script {
-          def bv = (env.GIT_TAG ?: 'v0.0.0').trim()
-          def cm = (env.GIT_SHA_FULL ?: '').trim()
-          writeFile file: 'ci-build-sunshine.sh', text: """set -euo pipefail
+        writeFile file: 'ci-build-sunshine.sh', text: '''set -euo pipefail
 export MSYSTEM=UCRT64
-export PATH="/ucrt64/bin:/usr/bin:/bin:\$PATH"
+export PATH="/ucrt64/bin:/usr/bin:/bin:$PATH"
 export NSISDIR=/ucrt64/share/nsis
 git submodule sync --recursive >/dev/null 2>&1 || true
 if [ ! -f third-party/moonlight-common-c/CMakeLists.txt ]; then
   git submodule update --init --recursive --jobs 8
 fi
-export COMMIT="${cm}"
-export BUILD_VERSION="${bv}"
+TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)"
+EXACT="$(git describe --tags --exact-match 2>/dev/null || echo)"
+DESC="$(git describe --tags --always 2>/dev/null || echo)"
+COMMIT="$(git rev-parse HEAD)"
+SHORT="$(git rev-parse --short=7 HEAD)"
+printf 'TAG=%s\nEXACT=%s\nDESC=%s\nCOMMIT=%s\nSHORT=%s\n' "$TAG" "$EXACT" "$DESC" "$COMMIT" "$SHORT" > ci-meta.properties
+export BUILD_VERSION="$TAG"
+export COMMIT="$COMMIT"
 cmake -B build -G Ninja -S . -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_DOCS=OFF -DSUNSHINE_ASSETS_DIR=assets -DSUNSHINE_PUBLISHER_NAME=LegionGames -DSUNSHINE_PUBLISHER_WEBSITE=https://legiongames.ru -DSUNSHINE_PUBLISHER_ISSUE_URL=https://legiongames.ru
 ninja -C build
 mkdir -p artifacts
@@ -40,15 +32,14 @@ cpack -G NSIS
 cpack -G ZIP
 mv ./cpack_artifacts/Sunshine.exe ../artifacts/Sunshine-Windows-AMD64-installer.exe
 mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-Windows-AMD64-portable.zip
-"""
-        }
+'''
         bat "C:\\msys64\\usr\\bin\\bash.exe -c \"tr -d '\\r' < ci-build-sunshine.sh > .ci-build.sh && bash -eo pipefail .ci-build.sh\""
       }
     }
     stage('Archive') {
       steps {
         archiveArtifacts artifacts: 'artifacts/**', fingerprint: true
-        stash name: 'artifacts', includes: 'artifacts/**'
+        stash name: 'artifacts', includes: 'artifacts/**, ci-meta.properties'
       }
     }
     stage('Publish to pkgs') {
@@ -56,12 +47,13 @@ mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-Windows-AMD64-portable.z
       steps {
         unstash 'artifacts'
         script {
-          def tag   = (env.GIT_TAG ?: 'v0.0.0').trim()
-          def exact = (env.GIT_EXACT ?: '').trim()
-          def desc  = (env.GIT_DESC ?: '').trim()
-          def sha   = (env.GIT_SHA ?: '').trim()
-          def full  = (env.GIT_SHA_FULL ?: '').trim()
-          if (!sha) { error 'No commit SHA available from SCM.' }
+          def meta = readProperties file: 'ci-meta.properties'
+          def tag   = (meta.TAG ?: 'v0.0.0').trim()
+          def exact = (meta.EXACT ?: '').trim()
+          def desc  = (meta.DESC ?: '').trim()
+          def sha   = (meta.SHORT ?: '').trim()
+          def full  = (meta.COMMIT ?: '').trim()
+          if (!sha) { error 'No commit SHA available.' }
           def verNoV = tag.startsWith('v') ? tag.substring(1) : tag
           def dirName = exact ? exact : "${tag}-${sha}"
           def base = '/pkgs/sunshine'
