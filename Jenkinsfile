@@ -27,7 +27,7 @@ export MSYSTEM=UCRT64
 export PATH="/ucrt64/bin:/usr/bin:/bin:\$PATH"
 export NSISDIR=/ucrt64/share/nsis
 git submodule sync --recursive
-git submodule update --init --recursive --depth 1 --jobs 8 || git submodule update --init --recursive --jobs 8
+git submodule update --init --recursive --jobs 8
 export COMMIT="${cm}"
 export BUILD_VERSION="${bv}"
 cmake -B build -G Ninja -S . -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_DOCS=OFF -DSUNSHINE_ASSETS_DIR=assets -DSUNSHINE_PUBLISHER_NAME=LegionGames -DSUNSHINE_PUBLISHER_WEBSITE=https://legiongames.ru -DSUNSHINE_PUBLISHER_ISSUE_URL=https://legiongames.ru
