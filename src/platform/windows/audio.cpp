@@ -5,6 +5,8 @@
 #define INITGUID
 
 // standard includes
+#include <atomic>
+#include <chrono>
 #include <format>
 
 // platform includes
@@ -1365,6 +1367,7 @@ namespace platf::audio {
       }
 
       mic_default_assigned = true;
+      platf::audio::mic_default_ready_flag.store(true, std::memory_order_release);
       BOOST_LOG(info) << "Set Steam Streaming Microphone as the default capture device"sv;
       return true;
     }
@@ -1389,6 +1392,7 @@ namespace platf::audio {
         return;
       }
       mic_default_assigned = false;
+      platf::audio::mic_default_ready_flag.store(false, std::memory_order_release);
 
       // If nothing was saved, hide the Steam mic briefly so Windows picks a default.
       if (assigned_mic.empty()) {
@@ -1741,6 +1745,15 @@ namespace platf::audio {
     std::wstring assigned_mic;  ///< Default capture device saved before Sunshine switched to the Steam microphone.
     bool mic_default_assigned = false;  ///< Whether Sunshine switched the default microphone this session.
   };
+
+  // Read by stream.cpp's mic render endpoint: it must open AFTER our
+  // default-capture switch has completed, otherwise the switch invalidates the
+  // freshly created audio client (AUDCLNT_E_DEVICE_INVALIDATED, 0x88890004).
+  std::atomic_bool mic_default_ready_flag { false };
+
+  bool mic_default_ready() {
+    return mic_default_ready_flag.load(std::memory_order_acquire);
+  }
 }  // namespace platf::audio
 
 namespace platf {

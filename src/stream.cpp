@@ -51,6 +51,21 @@ extern "C" {
 #include "thread_safe.h"
 #include "utility.h"
 
+// standard includes (kept late so it doesn't shadow platform helpers)
+#include <chrono>
+
+#ifdef _WIN32
+namespace platf::audio {
+  /**
+   * @brief Whether our default-capture switch has completed (windows/audio.cpp).
+   *
+   * The mic render endpoint must be created AFTER this, otherwise the switch
+   * reconfigures the Steam mic device and invalidates the new audio client.
+   */
+  bool mic_default_ready();
+}
+#endif
+
 constexpr int IDX_START_A = 0;  ///< Control-stream message index for the first stream-start packet.
 constexpr int IDX_START_B = 1;  ///< Control-stream message index for the second stream-start packet.
 constexpr int IDX_INVALIDATE_REF_FRAMES = 2;  ///< Control-stream message index for invalidate ref frames.
@@ -896,6 +911,9 @@ namespace stream {
 #ifdef _WIN32
       std::unique_ptr<mic_endpoint_t> endpoint;  ///< WASAPI render endpoint for the Steam mic.
       bool endpoint_init_attempted = false;  ///< Whether endpoint enumeration was attempted.
+      std::uint8_t reopen_attempts = 0;  ///< Re-open attempts after device invalidation (capped).
+      std::chrono::steady_clock::time_point first_frame_time;  ///< When the first mic frame arrived.
+      std::chrono::steady_clock::time_point last_reopen_at;    ///< Last invalidation re-open attempt.
 #endif
     } mic;  ///< Client-to-host microphone passthrough state.
 
@@ -1596,7 +1614,19 @@ namespace stream {
 
 #ifdef _WIN32
       // Lazy endpoint init on the first packet; attempted only once per session.
+      // Ordered: wait until our default-capture switch has completed, since it
+      // reconfigures the Steam mic device and would invalidate the client we
+      // are about to create (AUDCLNT_E_DEVICE_INVALIDATED). Bounded wait so a
+      // host without the Steam mic still gets its (futile) attempt.
+      const auto mic_now = std::chrono::steady_clock::now();
+      if (session->mic.first_frame_time == std::chrono::steady_clock::time_point {}) {
+        session->mic.first_frame_time = mic_now;
+      }
       if (!session->mic.endpoint_init_attempted) {
+        if (!platf::audio::mic_default_ready() &&
+            mic_now - session->mic.first_frame_time < std::chrono::seconds(3)) {
+          return;  // retry on the next packet; do not latch *_attempted yet
+        }
         session->mic.endpoint_init_attempted = true;
         session->mic.endpoint = open_steam_mic_endpoint();
       }
@@ -1620,6 +1650,23 @@ namespace stream {
           if (FAILED(hr_pad)) {
             BOOST_LOG(warning) << "Mic render: GetCurrentPadding failed [0x"sv
                                << util::hex(hr_pad).to_string_view() << "], dropping frame"sv;
+
+            // Recoverable device state (invalidation happens when our default-capture
+            // switch or a format change reconfigures the endpoint). Drop the dead client
+            // and re-open on the next packet, with a backoff and a per-session cap so we
+            // don't tight-loop on a genuinely dead device.
+            if (hr_pad == AUDCLNT_E_DEVICE_INVALIDATED || hr_pad == AUDCLNT_E_SERVICE_NOT_RUNNING) {
+              constexpr int MIC_REOPEN_MAX = 8;
+              if (session->mic.reopen_attempts >= MIC_REOPEN_MAX) {
+                BOOST_LOG(warning) << "Mic render: endpoint still invalid after "
+                                   << MIC_REOPEN_MAX << " re-opens, disabling mic for this session"sv;
+              } else if (mic_now - session->mic.last_reopen_at >= std::chrono::milliseconds(500)) {
+                session->mic.last_reopen_at = mic_now;
+                ++session->mic.reopen_attempts;
+                session->mic.endpoint.reset();
+                session->mic.endpoint_init_attempted = false;
+              }
+            }
           } else {
             const UINT32 available = (ep.buffer_frame_count > padding) ? (ep.buffer_frame_count - padding) : 0;
             if (available < static_cast<UINT32>(decodedSamples)) {
@@ -1662,6 +1709,19 @@ namespace stream {
             } else if (FAILED(hr)) {
               BOOST_LOG(warning) << "Mic render: GetBuffer failed [0x"sv
                                  << util::hex(hr).to_string_view() << ']';
+
+              if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_SERVICE_NOT_RUNNING) {
+                constexpr int MIC_REOPEN_MAX = 8;
+                if (session->mic.reopen_attempts >= MIC_REOPEN_MAX) {
+                  BOOST_LOG(warning) << "Mic render: endpoint still invalid after "
+                                     << MIC_REOPEN_MAX << " re-opens, disabling mic for this session"sv;
+                } else if (mic_now - session->mic.last_reopen_at >= std::chrono::milliseconds(500)) {
+                  session->mic.last_reopen_at = mic_now;
+                  ++session->mic.reopen_attempts;
+                  session->mic.endpoint.reset();
+                  session->mic.endpoint_init_attempted = false;
+                }
+              }
             }
           }
         }
