@@ -3594,7 +3594,14 @@ namespace confighttp {
 
     /** @brief Lowercase hex SHA-256 of a file (empty string on read failure). */
     std::string sha256_hex_of_file(const std::filesystem::path &path) {
-      const std::string data = file_handler::read_file(path.string().c_str());
+      // Read in BINARY mode: file_handler::read_file() opens in text mode, which
+      // on Windows performs CRLF translation and treats 0x1A as EOF — corrupting
+      // the hash of a binary installer.
+      std::ifstream in(path, std::ios::binary);
+      if (!in) {
+        return "";
+      }
+      const std::string data{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
       if (data.empty()) {
         return "";
       }
