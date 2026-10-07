@@ -85,6 +85,17 @@ jobs:
             -DSUNSHINE_PUBLISHER_ISSUE_URL="https://legiongames.ru"
           ninja -C build
 
+      - name: Restore NSIS plugins
+        # MSYS2's nsis 3.13 no longer ships the legacy InstallOptions plugin
+        # (needed by CPack's MUI1 welcome page) and possibly others. Copy the
+        # plugin set bundled in the repo into makensis's plugin directories.
+        shell: msys2 {0}
+        run: |
+          for d in "$MSYSTEM_PREFIX/share/nsis/Plugins/unicode" "$MSYSTEM_PREFIX/share/nsis/Plugins/x86-unicode"; do
+            mkdir -p "$d"
+            cp -f .github/nsis/plugins/*.dll "$d/"
+          done
+
       - name: Package
         shell: msys2 {0}
         run: |
