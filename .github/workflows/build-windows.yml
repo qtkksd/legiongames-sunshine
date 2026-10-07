@@ -95,6 +95,15 @@ jobs:
           mv ./cpack_artifacts/Sunshine.exe ../artifacts/Sunshine-Windows-AMD64-installer.exe
           mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-Windows-AMD64-portable.zip
 
+      - name: Dump NSIS log on failure
+        if: failure()
+        shell: msys2 {0}
+        run: |
+          echo "===== NSISOutput.log ====="
+          cat build/cpack_artifacts/_CPack_Packages/win64/NSIS/NSISOutput.log || echo "(no NSISOutput.log)"
+          echo "===== project.nsi (head) ====="
+          head -60 build/cpack_artifacts/_CPack_Packages/win64/NSIS/project.nsi || true
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
