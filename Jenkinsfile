@@ -20,9 +20,15 @@ pipeline {
     stage('Build (MSYS2 UCRT64)') {
       steps {
         script {
-          def s = '''set -euo pipefail
-export PATH="/ucrt64/bin:$PATH"
+          def bv = (env.GIT_TAG ?: 'v0.0.0').trim()
+          def cm = (env.GIT_SHA_FULL ?: '').trim()
+          def s = """set -euo pipefail
+export MSYSTEM=UCRT64
+export PATH="/ucrt64/bin:/usr/bin:/bin:\$PATH"
+export NSISDIR=/ucrt64/share/nsis
 git submodule update --init --recursive
+export COMMIT="${cm}"
+export BUILD_VERSION="${bv}"
 cmake -B build -G Ninja -S . -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_DOCS=OFF -DSUNSHINE_ASSETS_DIR=assets -DSUNSHINE_PUBLISHER_NAME=LegionGames -DSUNSHINE_PUBLISHER_WEBSITE=https://legiongames.ru -DSUNSHINE_PUBLISHER_ISSUE_URL=https://legiongames.ru
 ninja -C build
 mkdir -p artifacts
@@ -31,7 +37,7 @@ cpack -G NSIS
 cpack -G ZIP
 mv ./cpack_artifacts/Sunshine.exe ../artifacts/Sunshine-Windows-AMD64-installer.exe
 mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-Windows-AMD64-portable.zip
-'''
+"""
           def b64 = s.getBytes('UTF-8').encodeBase64().toString()
           bat "C:\\msys64\\usr\\bin\\bash.exe -leo pipefail -c \"echo ${b64} | base64 -d | bash -leo pipefail\""
         }
