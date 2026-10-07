@@ -22,7 +22,7 @@ pipeline {
         script {
           def bv = (env.GIT_TAG ?: 'v0.0.0').trim()
           def cm = (env.GIT_SHA_FULL ?: '').trim()
-          def s = """set -euo pipefail
+          writeFile file: 'ci-build-sunshine.sh', text: """set -euo pipefail
 export MSYSTEM=UCRT64
 export PATH="/ucrt64/bin:/usr/bin:/bin:\$PATH"
 export NSISDIR=/ucrt64/share/nsis
@@ -38,9 +38,8 @@ cpack -G ZIP
 mv ./cpack_artifacts/Sunshine.exe ../artifacts/Sunshine-Windows-AMD64-installer.exe
 mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-Windows-AMD64-portable.zip
 """
-          def b64 = s.getBytes('UTF-8').encodeBase64().toString()
-          bat "C:\\msys64\\usr\\bin\\bash.exe -eo pipefail -c \"echo ${b64} | base64 -d | bash -eo pipefail\""
         }
+        bat "C:\\msys64\\usr\\bin\\bash.exe -c \"tr -d '\\r' < ci-build-sunshine.sh > .ci-build.sh && bash -eo pipefail .ci-build.sh\""
       }
     }
     stage('Archive') {
