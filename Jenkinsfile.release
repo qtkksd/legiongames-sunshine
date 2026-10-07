@@ -9,7 +9,6 @@ set -euo pipefail
 REPO=https://github.com/qtkksd/legiongames-sunshine.git
 BASE=/pkgs/sunshine
 EXE=Sunshine-Windows-AMD64-installer.exe
-STABLE_URL=https://pkgs.legiongames.ru/sunshine/latest/Sunshine-Windows-AMD64-installer.exe
 tags=$(mktemp); cand=$(mktemp)
 git ls-remote --tags --refs "$REPO" 'refs/tags/v*' | sed 's#refs/tags/##' | awk '{print $2" "$1}' > "$tags"
 while read -r tag sha; do
@@ -39,10 +38,25 @@ h=$(sha256sum "$BASE/$tag/$EXE" | cut -d' ' -f1)
 sz=$(stat -c %s "$BASE/$tag/$EXE")
 build=$(jq -r '.build // 0' "$BASE/$tag/manifest.json" 2>/dev/null || echo 0)
 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-jq -n --arg ver "$ver" --arg tag "$tag" --arg sha "$sha7" --arg full "$sha" --argjson build "$build" --arg h "$h" --argjson sz "$sz" --arg ts "$ts" --arg url "$STABLE_URL" \
+# Immutable per-version artifact URL: a versioned manifest must reference the exact
+# bytes for THAT version, never the mutable "latest" symlink (else latest can move
+# between the manifest read and the download -> sha256 mismatch / TOCTOU).
+ASSET_URL="https://pkgs.legiongames.ru/sunshine/$tag/$EXE"
+jq -n --arg ver "$ver" --arg tag "$tag" --arg sha "$sha7" --arg full "$sha" --argjson build "$build" --arg h "$h" --argjson sz "$sz" --arg ts "$ts" --arg url "$ASSET_URL" \
   '{version:$ver,tag:$tag,commit:$sha,commit_full:$full,build:$build,channel:"stable",min_supported:"0.0.0",released_at:$ts,assets:{windows:{url:$url,sha256:$h,size:$sz}}}' \
   > "$BASE/$tag/manifest.json"
 echo "$sha7" > "$BASE/$tag/version"
+# Append-only release index so clients can list available versions / pick a
+# rollback target without scraping the directory (nginx has no autoindex here).
+IDX="$BASE/versions.json"
+entry=$(jq -n --arg ver "$ver" --arg tag "$tag" --arg sha "$sha7" --arg full "$sha" --argjson build "$build" --arg ts "$ts" \
+  '{version:$ver,tag:$tag,commit:$sha,commit_full:$full,build:$build,released_at:$ts}')
+if [ -f "$IDX" ]; then
+  tmp=$(mktemp)
+  jq --argjson e "$entry" 'map(select(.tag != $e.tag)) + [$e] | sort_by(.build)' "$IDX" > "$tmp" && mv "$tmp" "$IDX"
+else
+  jq -n --argjson e "$entry" '[$e]' > "$IDX"
+fi
 ( cd "$BASE" && ln -sfn "$tag" latest.new && mv -T latest.new latest )
 echo "stable latest -> $tag"
 '''

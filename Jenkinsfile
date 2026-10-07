@@ -75,7 +75,7 @@ mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-Windows-AMD64-portable.z
   "released_at": "${ts}",
   "assets": {
     "windows": {
-      "url": "https://pkgs.legiongames.ru/sunshine/edge/latest/Sunshine-Windows-AMD64-installer.exe",
+      "url": "https://pkgs.legiongames.ru/sunshine/commits/${sha}/Sunshine-Windows-AMD64-installer.exe",
       "sha256": "${h}",
       "size": ${sz}
     }

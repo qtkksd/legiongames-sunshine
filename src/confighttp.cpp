@@ -3764,7 +3764,39 @@ namespace confighttp {
     }
 #endif
 
-    void upgrade_background_task(bool force, bool rollback_on_failure) {
+    /**
+     * @brief Validate a release version such as "1.2.16" or "v1.2.16".
+     * @return The normalized "vX.Y.Z" form, or an empty string when invalid.
+     *
+     * Guards the version used to build a pkgs URL so a malformed value cannot
+     * escape the /sunshine/<version>/ path segment.
+     */
+    std::string normalize_version_tag(const std::string &in) {
+      if (in.empty() || in.size() > 32) {
+        return {};
+      }
+      const std::string v = (in[0] == 'v') ? in : ("v" + in);
+      if (v.size() < 5) {
+        return {};
+      }
+      int dots = 0;
+      for (std::size_t i = 1; i < v.size(); ++i) {
+        if (v[i] == '.') {
+          if (i == 1 || v[i - 1] == '.' || dots >= 2) {
+            return {};
+          }
+          ++dots;
+        } else if (v[i] < '0' || v[i] > '9') {
+          return {};
+        }
+      }
+      if (dots != 2 || v.back() == '.') {
+        return {};
+      }
+      return v;
+    }
+
+    void upgrade_background_task(bool force, bool rollback_on_failure, std::string pinned_version = "") {
       upgrade_in_progress.store(true);
       {
         std::lock_guard<std::mutex> lock(upgrade_mutex);
@@ -3772,12 +3804,16 @@ namespace confighttp {
         upgrade_latest_version.clear();
       }
 
-      BOOST_LOG(info) << "Upgrade: checking pkgs manifest..."sv;
+      // An explicit version pins the manifest to that immutable release directory
+      // (e.g. .../sunshine/v1.2.16/manifest.json); otherwise use the channel head.
+      const std::string manifest_url = pinned_version.empty()
+        ? "https://pkgs.legiongames.ru/sunshine/latest/manifest.json"
+        : "https://pkgs.legiongames.ru/sunshine/" + pinned_version + "/manifest.json";
+
+      BOOST_LOG(info) << "Upgrade: checking pkgs manifest ("sv << manifest_url << ")..."sv;
 
       // 1. Fetch the pkgs manifest (single source of truth for version + asset).
-      std::string manifest_json = fetch_url(
-        "https://pkgs.legiongames.ru/sunshine/latest/manifest.json"
-      );
+      std::string manifest_json = fetch_url(manifest_url);
 
       if (manifest_json.empty()) {
         std::lock_guard<std::mutex> lock(upgrade_mutex);
@@ -4106,6 +4142,106 @@ namespace confighttp {
     output_tree["error"] = "Upgrade is only available on Windows";
 #endif
 
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Roll back to (or pin the client to) an explicit released version.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * Body: {"version":"v1.2.16"} (a leading "v" is optional). The version selects
+   * an immutable pkgs release directory (.../sunshine/<version>/manifest.json);
+   * the normal update pipeline then downloads, sha256-verifies and installs it.
+   * The target is explicit, so any direction is allowed (upgrade or downgrade).
+   *
+   * @api_examples{/api/upgrade/rollback| POST| null}
+   */
+  void doUpgradeRollback(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
+    print_req(request);
+
+    std::string version;
+    try {
+      auto body = nlohmann::json::parse(request->content.string());
+      version = body.value("version", body.value("tag", std::string {}));
+    } catch (...) {}
+
+    nlohmann::json output_tree;
+
+    const std::string normalized = normalize_version_tag(version);
+    if (normalized.empty()) {
+      output_tree["status"] = false;
+      output_tree["error"] = "Missing or invalid 'version' (expected e.g. {\"version\":\"v1.2.16\"})";
+      send_response(response, output_tree);
+      return;
+    }
+
+#ifdef _WIN32
+    bool expected = false;
+    if (!upgrade_in_progress.compare_exchange_strong(expected, true)) {
+      output_tree["status"] = false;
+      output_tree["error"] = "Upgrade already in progress";
+      send_response(response, output_tree);
+      return;
+    }
+
+    // force=true installs the pinned version regardless of direction.
+    std::thread upgrade_thread(upgrade_background_task, true, true, normalized);
+    upgrade_thread.detach();
+
+    output_tree["status"] = true;
+    output_tree["message"] = "Rollback started";
+    output_tree["version"] = normalized;
+#else
+    output_tree["status"] = false;
+    output_tree["error"] = "Upgrade is only available on Windows";
+#endif
+
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief List released versions available on pkgs (release index).
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * Proxies https://pkgs.legiongames.ru/sunshine/versions.json so a caller can
+   * pick an explicit rollback target without scraping the directory.
+   *
+   * @api_examples{/api/upgrade/versions| GET| null}
+   */
+  void getUpgradeVersions(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    const std::string body = fetch_url("https://pkgs.legiongames.ru/sunshine/versions.json");
+    if (body.empty()) {
+      nlohmann::json err;
+      err["status"] = false;
+      err["error"] = "Failed to fetch versions index";
+      send_response(response, err);
+      return;
+    }
+
+    nlohmann::json output_tree;
+    try {
+      output_tree["versions"] = nlohmann::json::parse(body);
+    } catch (...) {
+      output_tree["status"] = false;
+      output_tree["error"] = "Failed to parse versions index";
+    }
     send_response(response, output_tree);
   }
 
@@ -4476,6 +4612,8 @@ namespace confighttp {
     server.resource["^/api/health$"]["GET"] = getHealth;
     server.resource["^/api/upgrade/status$"]["GET"] = getUpgradeStatus;
     server.resource["^/api/upgrade$"]["POST"] = doUpgrade;
+    server.resource["^/api/upgrade/rollback$"]["POST"] = doUpgradeRollback;
+    server.resource["^/api/upgrade/versions$"]["GET"] = getUpgradeVersions;
     server.resource["^/api/update-netbird/status$"]["GET"] = getNetBirdUpdateStatus;
     server.resource["^/api/update-netbird$"]["POST"] = doNetBirdUpdate;
     server.resource["^/api/diskguard/status$"]["GET"] = getDiskGuardStatus;
