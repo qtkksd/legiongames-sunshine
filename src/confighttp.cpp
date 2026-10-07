@@ -4132,7 +4132,9 @@ namespace confighttp {
       return;
     }
 
-    std::thread upgrade_thread(upgrade_background_task, force, rollback_on_failure);
+    // NB: std::thread does not apply default arguments (the function decays to a
+    // pointer), so pass the pinned version explicitly (empty = channel head).
+    std::thread upgrade_thread(upgrade_background_task, force, rollback_on_failure, std::string {});
     upgrade_thread.detach();
 
     output_tree["status"] = true;
