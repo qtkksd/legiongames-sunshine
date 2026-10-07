@@ -1,0 +1,53 @@
+pipeline {
+  agent { label 'controller' }
+  options { timestamps() }
+  triggers { pollSCM('H/2 * * * *') }
+  stages {
+    stage('Promote highest tagged release to stable') {
+      steps {
+        sh '''#!/bin/bash
+set -euo pipefail
+REPO=https://github.com/qtkksd/legiongames-sunshine.git
+BASE=/pkgs/sunshine
+EXE=Sunshine-Windows-AMD64-installer.exe
+STABLE_URL=https://pkgs.legiongames.ru/sunshine/latest/Sunshine-Windows-AMD64-installer.exe
+tags=$(mktemp); cand=$(mktemp)
+git ls-remote --tags --refs "$REPO" 'refs/tags/v*' | sed 's#refs/tags/##' | awk '{print $2" "$1}' > "$tags"
+while read -r tag sha; do
+  [ -n "${tag:-}" ] || continue
+  case "$tag" in v[0-9]*.[0-9]*.[0-9]*) ;; *) continue;; esac
+  sha7=$(printf '%s' "$sha" | cut -c1-7)
+  if [ -f "$BASE/commits/$sha7/$EXE" ]; then src="$BASE/commits/$sha7"
+  elif [ -f "$BASE/$tag/$EXE" ]; then src="$BASE/$tag"
+  else continue; fi
+  printf '%s|%s|%s|%s\n' "$tag" "$sha" "$sha7" "$src" >> "$cand"
+done < "$tags"
+if [ ! -s "$cand" ]; then echo "no tagged artifacts available yet"; exit 0; fi
+pick=$(sort -t'|' -k1,1V "$cand" | tail -1)
+tag=$(printf '%s' "$pick" | cut -d'|' -f1)
+sha=$(printf '%s' "$pick" | cut -d'|' -f2)
+sha7=$(printf '%s' "$pick" | cut -d'|' -f3)
+src=$(printf '%s' "$pick" | cut -d'|' -f4)
+if [ -L "$BASE/latest" ] && [ "$(readlink "$BASE/latest")" = "$tag" ] && [ -f "$BASE/$tag/manifest.json" ]; then
+  echo "stable already at $tag; nothing to do"; exit 0
+fi
+echo "promote $tag (commit $sha7) from $src"
+if [ "$src" != "$BASE/$tag" ]; then
+  rm -rf "$BASE/$tag.tmp"; cp -a "$src" "$BASE/$tag.tmp"; rm -rf "$BASE/$tag"; mv -T "$BASE/$tag.tmp" "$BASE/$tag"
+fi
+ver=${tag#v}
+h=$(sha256sum "$BASE/$tag/$EXE" | cut -d' ' -f1)
+sz=$(stat -c %s "$BASE/$tag/$EXE")
+build=$(jq -r '.build // 0' "$BASE/$tag/manifest.json" 2>/dev/null || echo 0)
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+jq -n --arg ver "$ver" --arg tag "$tag" --arg sha "$sha7" --arg full "$sha" --argjson build "$build" --arg h "$h" --argjson sz "$sz" --arg ts "$ts" --arg url "$STABLE_URL" \
+  '{version:$ver,tag:$tag,commit:$sha,commit_full:$full,build:$build,channel:"stable",min_supported:"0.0.0",released_at:$ts,assets:{windows:{url:$url,sha256:$h,size:$sz}}}' \
+  > "$BASE/$tag/manifest.json"
+echo "$sha7" > "$BASE/$tag/version"
+( cd "$BASE" && ln -sfn "$tag" latest.new && mv -T latest.new latest )
+echo "stable latest -> $tag"
+'''
+      }
+    }
+  }
+}
