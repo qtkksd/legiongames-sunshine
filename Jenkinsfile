@@ -42,25 +42,23 @@ mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-Windows-AMD64-portable.z
         stash name: 'artifacts', includes: 'artifacts/**, ci-meta.properties'
       }
     }
-    stage('Publish to pkgs') {
+    stage('Publish (edge, commit-keyed)') {
       agent { label 'controller' }
       steps {
         unstash 'artifacts'
         script {
           def meta = readProperties file: 'ci-meta.properties'
-          def tag   = (meta.TAG ?: 'v0.0.0').trim()
-          def exact = (meta.EXACT ?: '').trim()
+          def tag   = (meta.TAG ?: '').trim()
           def desc  = (meta.DESC ?: '').trim()
           def sha   = (meta.SHORT ?: '').trim()
           def full  = (meta.COMMIT ?: '').trim()
           if (!sha) { error 'No commit SHA available.' }
-          def verNoV = tag.startsWith('v') ? tag.substring(1) : tag
-          def dirName = exact ? exact : "${tag}-${sha}"
+          def verNoV = tag.startsWith('v') ? tag.substring(1) : (tag ?: '0.0.0')
           def base = '/pkgs/sunshine'
-          def vdir = "${base}/${dirName}"
-          sh "mkdir -p ${vdir}"
-          sh "cp artifacts/Sunshine-Windows-AMD64-installer.exe ${vdir}/"
-          sh "cp artifacts/Sunshine-Windows-AMD64-portable.zip ${vdir}/ || true"
+          def cdir = "${base}/commits/${sha}"
+          sh "mkdir -p ${cdir}"
+          sh "cp artifacts/Sunshine-Windows-AMD64-installer.exe ${cdir}/"
+          sh "cp artifacts/Sunshine-Windows-AMD64-portable.zip ${cdir}/ || true"
           def exe = 'artifacts/Sunshine-Windows-AMD64-installer.exe'
           def h = sh(script: "sha256sum ${exe} | cut -d' ' -f1", returnStdout: true).trim()
           def sz = sh(script: "stat -c %s ${exe}", returnStdout: true).trim()
@@ -72,22 +70,22 @@ mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-Windows-AMD64-portable.z
   "commit_full": "${full}",
   "describe": "${desc}",
   "build": ${env.BUILD_NUMBER},
-  "channel": "stable",
+  "channel": "edge",
   "min_supported": "0.0.0",
   "released_at": "${ts}",
   "assets": {
     "windows": {
-      "url": "https://pkgs.legiongames.ru/sunshine/latest/Sunshine-Windows-AMD64-installer.exe",
+      "url": "https://pkgs.legiongames.ru/sunshine/edge/latest/Sunshine-Windows-AMD64-installer.exe",
       "sha256": "${h}",
       "size": ${sz}
     }
   }
 }
 """
-          writeFile file: "${vdir}/manifest.json", text: manifest
-          writeFile file: "${vdir}/version", text: sha
-          sh "cd ${base} && ln -sfn ${dirName} latest.new && mv -T latest.new latest"
-          echo "Published sunshine ${dirName}: version=${verNoV} commit=${sha} build=${env.BUILD_NUMBER}"
+          writeFile file: "${cdir}/manifest.json", text: manifest
+          writeFile file: "${cdir}/version", text: sha
+          sh "mkdir -p ${base}/edge && cd ${base}/edge && ln -sfn ../commits/${sha} latest.new && mv -T latest.new latest"
+          echo "Published edge ${sha}: version=${verNoV} commit=${sha} build=${env.BUILD_NUMBER}"
         }
       }
     }
