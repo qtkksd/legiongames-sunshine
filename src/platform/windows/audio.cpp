@@ -225,6 +225,16 @@ namespace {
 using namespace std::literals;
 
 namespace platf::audio {
+  // Shared (per-process) signal for stream.cpp's mic render endpoint: it must
+  // open AFTER our default-capture switch completes, otherwise the switch
+  // reconfigures the Steam mic device and invalidates the freshly created audio
+  // client (AUDCLNT_E_DEVICE_INVALIDATED, 0x88890004).
+  std::atomic_bool mic_default_ready_flag { false };
+
+  bool mic_default_ready() {
+    return mic_default_ready_flag.load(std::memory_order_acquire);
+  }
+
   /**
    * @brief Release the COM or platform reference owned by the pointer.
    *
@@ -1745,15 +1755,6 @@ namespace platf::audio {
     std::wstring assigned_mic;  ///< Default capture device saved before Sunshine switched to the Steam microphone.
     bool mic_default_assigned = false;  ///< Whether Sunshine switched the default microphone this session.
   };
-
-  // Read by stream.cpp's mic render endpoint: it must open AFTER our
-  // default-capture switch has completed, otherwise the switch invalidates the
-  // freshly created audio client (AUDCLNT_E_DEVICE_INVALIDATED, 0x88890004).
-  std::atomic_bool mic_default_ready_flag { false };
-
-  bool mic_default_ready() {
-    return mic_default_ready_flag.load(std::memory_order_acquire);
-  }
 }  // namespace platf::audio
 
 namespace platf {
