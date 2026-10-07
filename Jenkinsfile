@@ -10,10 +10,10 @@ pipeline {
           def BASH = 'C:\\msys64\\usr\\bin\\bash.exe'
           env.GIT_SHA  = env.GIT_COMMIT.take(7)
           env.GIT_SHA_FULL = env.GIT_COMMIT
-          bat(script: "${BASH} -lc \"git fetch --tags --force >/dev/null 2>&1 || true\"", returnStatus: true)
-          env.GIT_TAG   = bat(script: "${BASH} -lc \"git describe --tags --abbrev=0 2>/dev/null || true\"", returnStdout: true).trim()
-          env.GIT_EXACT = bat(script: "${BASH} -lc \"git describe --tags --exact-match 2>/dev/null || true\"", returnStdout: true).trim()
-          env.GIT_DESC  = bat(script: "${BASH} -lc \"git describe --tags --always\"", returnStdout: true).trim()
+          bat(script: "${BASH} -c \"git fetch --tags --force >/dev/null 2>&1 || true\"", returnStatus: true)
+          env.GIT_TAG   = bat(script: "${BASH} -c \"git describe --tags --abbrev=0 2>/dev/null || true\"", returnStdout: true).trim()
+          env.GIT_EXACT = bat(script: "${BASH} -c \"git describe --tags --exact-match 2>/dev/null || true\"", returnStdout: true).trim()
+          env.GIT_DESC  = bat(script: "${BASH} -c \"git describe --tags --always\"", returnStdout: true).trim()
         }
       }
     }
@@ -39,7 +39,7 @@ mv ./cpack_artifacts/Sunshine.exe ../artifacts/Sunshine-Windows-AMD64-installer.
 mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-Windows-AMD64-portable.zip
 """
           def b64 = s.getBytes('UTF-8').encodeBase64().toString()
-          bat "C:\\msys64\\usr\\bin\\bash.exe -leo pipefail -c \"echo ${b64} | base64 -d | bash -leo pipefail\""
+          bat "C:\\msys64\\usr\\bin\\bash.exe -eo pipefail -c \"echo ${b64} | base64 -d | bash -eo pipefail\""
         }
       }
     }
