@@ -6,7 +6,8 @@ pipeline {
       steps {
         sh '''#!/bin/bash
 set -euo pipefail
-REPO=https://github.com/qtkksd/legiongames-sunshine.git
+PAT=$(bao-get github GITHUB_API_PAT)
+REPO="https://x-access-token:${PAT}@github.com/qtkksd/legiongames-sunshine.git"
 BASE=/pkgs/sunshine
 EXE=Sunshine-Windows-AMD64-installer.exe
 tags=$(mktemp); cand=$(mktemp)
