@@ -3063,9 +3063,32 @@ namespace confighttp {
       }
     }
 
+    // Recorded targets are the persisted block intent. A "removed"/"ejected"
+    // target's subtree is hidden from the PRESENT-only enumeration above, so it
+    // never reports a problem code — an absent recorded target is still blocked.
+    // Without this the status reports blocked=false while input is in fact off.
+    std::set<std::string> present_ids;
+    for (const auto &device : all_devices) {
+      present_ids.insert(device.instance_id);
+    }
+
     nlohmann::json recorded = nlohmann::json::array();
+    int recorded_active_count = 0;
     for (const auto &target : read_blocked_targets()) {
       recorded.push_back({{"instance_id", target.instance_id}, {"method", target.method}, {"parent", target.parent_id}});
+      if (present_ids.find(target.instance_id) == present_ids.end()) {
+        blocked = true;
+        ++recorded_active_count;
+        nlohmann::json node = {
+          {"instance_id", target.instance_id},
+          {"name", target.instance_id},
+          {"parent", target.parent_id},
+          {"method", target.method},
+          {"absent", true}
+        };
+        blocked_nodes.push_back(node);
+        hidden_blocked.push_back(node);
+      }
     }
 
     output_tree["configured"] = true;
@@ -3085,6 +3108,7 @@ namespace confighttp {
     output_tree["hidden_blocked"] = hidden_blocked;
     output_tree["devices"] = devices_json;
     output_tree["recorded_targets"] = recorded;
+    output_tree["recorded_active_count"] = recorded_active_count;
 #else
     output_tree["configured"] = false;
     output_tree["error"] = "Input blocking is only available on Windows";
