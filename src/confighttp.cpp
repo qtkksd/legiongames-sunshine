@@ -4361,6 +4361,7 @@ namespace confighttp {
       return false;
     }
 
+    const auto start_time = std::chrono::steady_clock::now();
     auto child = platf::run_command(true, false, cmd, working_dir, {}, tmp, ec, nullptr);
     if (ec || !child.valid()) {
       std::fclose(tmp);
@@ -4370,6 +4371,8 @@ namespace confighttp {
 
     child.wait();
     const int exit_code = child.exit_code();
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start_time).count();
     std::rewind(tmp);
 
     std::string content;
@@ -4378,10 +4381,6 @@ namespace confighttp {
       content += buffer;
     }
     std::fclose(tmp);
-
-    if (!content.empty()) {
-      BOOST_LOG(info) << "DiskGuard [" << args << "] exit=" << exit_code << " out=" << content;
-    }
 
     try {
       out = nlohmann::json::parse(content);
@@ -4401,6 +4400,23 @@ namespace confighttp {
         out = nlohmann::json::object();
         out["raw"] = content;
       }
+    }
+
+    // Surface the revert method (journal vs robocopy) + duration so the
+    // Sunshine log and the caller can tell how the operation actually ran.
+    std::string method;
+    if (out.is_object()) {
+      if (out.contains("method") && out["method"].is_string()) {
+        method = out["method"].get<std::string>();
+      } else if (out.contains("revert") && out["revert"].is_object() &&
+                 out["revert"].contains("method") && out["revert"]["method"].is_string()) {
+        method = out["revert"]["method"].get<std::string>();
+      }
+    }
+    if (!content.empty()) {
+      const std::string suffix = method.empty() ? std::string() : (" method=" + method);
+      BOOST_LOG(info) << "DiskGuard [" << args << "] exit=" << exit_code
+                      << " duration_ms=" << elapsed_ms << suffix << " out=" << content;
     }
 
     if (exit_code != 0) {
