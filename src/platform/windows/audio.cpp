@@ -1323,6 +1323,154 @@ namespace platf::audio {
     }
 
     /**
+     * @brief Move the default endpoint for a flow off the Steam virtual device.
+     *
+     * Race-free replacement for reset_default_device()/reset_default_microphone():
+     * it hides the Steam endpoint, then synchronously waits for Windows to select
+     * a new default (re-reading with a freshly created enumerator each time to
+     * avoid the stale cache that made the old helpers unreliable), pins that
+     * device for every role, and only then re-enables the Steam endpoint. Windows
+     * still chooses which device to fall back to.
+     *
+     * @param flow Endpoint direction whose default to check.
+     * @param steam_match Match fields identifying the Steam endpoint.
+     * @return `true` if the default is (or becomes) a non-Steam device.
+     */
+    bool reset_steam_default_sync(EDataFlow flow, const match_fields_list_t &steam_match) {
+      const bool render = flow == eRender;
+      const char *flow_name = render ? "output" : "capture";
+      const std::string steam_name = utf_utils::to_utf8(steam_match.empty() ? std::wstring() : steam_match[0].second);
+
+      auto matched_steam = find_device_id(steam_match, flow);
+      if (!matched_steam) {
+        return true;  // no Steam device on this flow, nothing to do
+      }
+      const std::wstring steam_id = matched_steam->second;
+
+      // Read the current default with a FRESH enumerator. A long-lived enumerator
+      // can keep reporting the endpoint that was default before a visibility
+      // change, which is the race this helper exists to avoid.
+      auto read_default = [&](std::wstring &id, std::wstring &friendly) -> bool {
+        audio::device_enum_t fresh;
+        if (FAILED(CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL, IID_IMMDeviceEnumerator, (void **) &fresh))) {
+          return false;
+        }
+
+        audio::device_t device;
+        if (FAILED(fresh->GetDefaultAudioEndpoint(flow, eConsole, &device))) {
+          return false;
+        }
+
+        audio::wstring_t id_w;
+        device->GetId(&id_w);
+        const wchar_t *id_p = id_w.get();
+        id = id_p ? id_p : L"";
+
+        audio::prop_t prop;
+        if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &prop))) {
+          prop_var_t name;
+          if (SUCCEEDED(prop->GetValue(PKEY_Device_FriendlyName, &name.prop)) && name.prop.pwszVal) {
+            friendly = name.prop.pwszVal;
+          }
+        }
+
+        return !id.empty();
+      };
+
+      {
+        std::wstring id;
+        std::wstring friendly;
+        if (read_default(id, friendly) && id != steam_id) {
+          BOOST_LOG(debug) << "Default "sv << flow_name << " is not Steam "sv << steam_name << "; nothing to do"sv;
+          return true;  // already a non-Steam default
+        }
+      }
+
+      // Steam is the default: hide it and wait for Windows to pick another device.
+      // If Steam is the only active endpoint there is nothing to fall back to, so
+      // do not hide it (that would only stall startup for the whole wait window).
+      {
+        audio::device_enum_t fresh;
+        if (SUCCEEDED(CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL, IID_IMMDeviceEnumerator, (void **) &fresh))) {
+          collection_t collection;
+          if (SUCCEEDED(fresh->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, &collection))) {
+            UINT count = 0;
+            collection->GetCount(&count);
+
+            bool has_other = false;
+            for (UINT i = 0; i < count && !has_other; ++i) {
+              audio::device_t device;
+              collection->Item(i, &device);
+              audio::wstring_t id_w;
+              device->GetId(&id_w);
+              const wchar_t *id_p = id_w.get();
+              if (id_p && steam_id != id_p) {
+                has_other = true;
+              }
+            }
+
+            if (!has_other) {
+              BOOST_LOG(debug) << "Steam "sv << steam_name << " is the only active "sv << flow_name << " device; leaving the default unchanged"sv;
+              return false;
+            }
+          }
+        }
+      }
+
+      for (int attempt = 0; attempt < 4; ++attempt) {
+        auto hr = policy->SetEndpointVisibility(steam_id.c_str(), FALSE);
+        if (FAILED(hr)) {
+          BOOST_LOG(warning) << "Failed to hide Steam "sv << steam_name << " endpoint: 0x"sv << util::hex(hr).to_string_view();
+          return false;
+        }
+        BOOST_LOG(debug) << "Hid Steam "sv << steam_name << " endpoint; waiting for Windows to re-select the default "sv << flow_name << " (attempt "sv << attempt + 1 << ')';
+
+        bool found = false;
+        std::wstring chosen_id;
+        std::wstring chosen_name;
+        for (int poll = 0; poll < 12; ++poll) {
+          Sleep(200);
+
+          std::wstring id;
+          std::wstring friendly;
+          if (read_default(id, friendly) && id != steam_id) {
+            chosen_id = id;
+            chosen_name = friendly;
+            found = true;
+            break;
+          }
+        }
+
+        // Pin Windows' pick while Steam is still hidden, so re-enabling Steam
+        // cannot silently reclaim the default.
+        if (found) {
+          for (int x = 0; x < (int) ERole_enum_count; ++x) {
+            policy->SetDefaultEndpoint(chosen_id.c_str(), (ERole) x);
+          }
+        }
+
+        // Re-enable Steam only once a non-Steam default has been observed.
+        auto hr_enable = policy->SetEndpointVisibility(steam_id.c_str(), TRUE);
+        if (FAILED(hr_enable)) {
+          BOOST_LOG(warning) << "Failed to re-enable Steam "sv << steam_name << " endpoint: 0x"sv << util::hex(hr_enable).to_string_view();
+        } else {
+          BOOST_LOG(debug) << "Re-enabled Steam "sv << steam_name << " endpoint"sv;
+        }
+
+        if (found) {
+          const std::string chosen_name_utf8 = chosen_name.empty() ? std::string("<unnamed>") : utf_utils::to_utf8(chosen_name);
+          BOOST_LOG(info) << "Windows default "sv << flow_name << " was Steam "sv << steam_name
+                          << "; switched to ["sv << chosen_name_utf8 << ']';
+          return true;
+        }
+      }
+
+      BOOST_LOG(warning) << "Steam "sv << steam_name << " is still the default "sv << flow_name
+                         << " and no other device became available"sv;
+      return false;
+    }
+
+    /**
      * @brief Point the default capture device at the Steam Streaming Microphone.
      *
      * Sets the virtual microphone as the default for every role. This is the
@@ -1628,7 +1776,7 @@ namespace platf::audio {
         return;
       }
 
-      auto matched = find_device_id(match_steam_microphone());
+      auto matched = find_device_id(match_steam_microphone(), eCapture);
       if (!matched) {
         return;
       }
@@ -1811,8 +1959,13 @@ namespace platf {
       // stream is required. This MUST run after init(): it uses device_enum
       // and policy, which init() creates.
       audio_ctrl.install_steam_microphone_driver();
-      audio_ctrl.reset_default_device();
-      audio_ctrl.reset_default_microphone();
+
+      // Move the Windows default output/capture off any Steam virtual device left
+      // selected by a corrupted image or a failed stream teardown. Unlike the
+      // reset_default_* helpers this waits for Windows to actually re-select a
+      // device before validating, so the outcome is not decided by a race.
+      audio_ctrl.reset_steam_default_sync(eRender, audio_ctrl.match_steam_speakers());
+      audio_ctrl.reset_steam_default_sync(eCapture, audio_ctrl.match_steam_microphone());
     }
 
     return co_init;
