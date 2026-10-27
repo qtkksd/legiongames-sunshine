@@ -1,7 +1,6 @@
 pipeline {
   agent { label 'windows-msys2' }
   options { timestamps(); disableConcurrentBuilds() }
-  triggers { pollSCM('H/2 * * * *') }
   stages {
     stage('Checkout') {
       steps { checkout scm }
